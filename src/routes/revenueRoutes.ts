@@ -22,11 +22,12 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9
 const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})?)?$/;
 
 /**
- * @dev Positive decimal string, integer or up to 18 decimal places.
- *      Bounded quantifier {1,18} prevents catastrophic backtracking.
+ * @dev Positive decimal string, integer or up to 10 decimal places.
+ *      Matches database schema NUMERIC(30,10) precision: 20 integer digits + 10 decimal places.
+ *      Bounded quantifier {1,10} prevents catastrophic backtracking.
  *      Security: rejects negative amounts, zero-prefix abuse, and non-numeric strings at middleware layer.
  */
-const POSITIVE_DECIMAL_REGEX = /^\d+(\.\d{1,18})?$/;
+const POSITIVE_DECIMAL_REGEX = /^\d+(\.\d{1,10})?$/;
 
 /**
  * @dev Param schema applied to routes with :id path segment representing an offering UUID.
@@ -107,7 +108,7 @@ export const createRevenueRoutes = (db: Pool): Router => {
         '/revenue-reports',
         validateBody(revenueReportBodySchema),
         authMiddleware(),
-        revenueHandler.submitReport
+        revenueHandler.submitReportByBody
     );
 
     return router;
