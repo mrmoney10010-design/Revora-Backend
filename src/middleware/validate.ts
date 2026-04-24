@@ -1,6 +1,13 @@
 import { Request, Response, NextFunction, RequestHandler } from 'express';
+/**
+ * @fileoverview Generic validation middleware for Express routes.
+ * This module provides `validateParams` and `validateBody` functions to validate
+ * request parameters and body against defined schemas using regular expressions
+ * and basic type checks.
+ */
 
 type PrimitiveType = 'string' | 'number' | 'boolean';
+import { Request, Response, NextFunction } from 'express';
 
 export type FieldSchema = {
   type: PrimitiveType;
@@ -158,3 +165,8 @@ export function validate(arg: ObjectSchema | ValidateOptions): RequestHandler[] 
   return validateBody(arg as ObjectSchema);
 }
 
+/**
+ * @interface ValidationRule
+ * @description Defines a validation rule for a single field.
+ * @property {boolean} required - True if the field is mandatory.
+ * @property
