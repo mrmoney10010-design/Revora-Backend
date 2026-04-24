@@ -55,7 +55,7 @@ class MockResponse extends EventEmitter {
   }
 }
 
-function createRequest(method: string, key?: string, headers: Record<string, string> = {}): Partial<Request> {
+function createRequest(method: string, key?: string, body: any = null, headers: Record<string, string> = {}): Partial<Request> {
   const allHeaders: Record<string, string> = { ...headers };
   if (key) {
     allHeaders['idempotency-key'] = key;
@@ -64,6 +64,7 @@ function createRequest(method: string, key?: string, headers: Record<string, str
   return {
     method,
     path: '/api/test',
+    body,
     get: ((name: string) => allHeaders[name.toLowerCase()]) as Request['get'],
     header: ((name: string) => allHeaders[name.toLowerCase()]) as Request['header'],
   };
@@ -126,6 +127,32 @@ describe('Idempotency Middleware', () => {
       expect(res2.statusCode).toBe(201);
       expect(res2.body).toEqual({ ok: true });
       expect(res2.headers['idempotency-status']).toBe('cached');
+    });
+
+    it('returns 400 Bad Request for same key but different body', async () => {
+      const middleware = createIdempotencyMiddleware({
+        store: new InMemoryIdempotencyStore(),
+      });
+
+      const req1 = createRequest('POST', 'key-mismatch', { val: 1 }) as Request;
+      const res1 = new MockResponse();
+      const next1: NextFunction = jest.fn(() => {
+        res1.status(200).json({ ok: true });
+      });
+
+      await middleware(req1, res1 as unknown as Response, next1);
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      const req2 = createRequest('POST', 'key-mismatch', { val: 2 }) as Request;
+      const res2 = new MockResponse();
+      const next2: NextFunction = jest.fn();
+
+      await middleware(req2, res2 as unknown as Response, next2);
+
+      expect(next2).toHaveBeenCalledWith(expect.any(AppError));
+      const error = (next2 as jest.Mock).mock.calls[0][0] as AppError;
+      expect(error.statusCode).toBe(400);
+      expect(error.message).toContain('mismatch');
     });
 
     it('returns 409 Conflict for in-flight duplicate requests', async () => {
@@ -234,13 +261,24 @@ describe('Idempotency Middleware', () => {
       const middleware = createIdempotencyMiddleware({ store });
 
       // Manually inject bad record
+      const requestHash = (middleware as any).generateRequestHash ? (middleware as any).generateRequestHash(createRequest('POST', 'bad-json')) : 'any';
+      // Wait, I can't easily call generateRequestHash as it's private/local.
+      // I'll just use what generateRequestHash would produce for a simple POST with no body.
+      // OR better, I'll just use a dummy hash and pass it.
+      
+      // Actually, createIdempotencyMiddleware is what I have.
+      // I'll just look at what generateRequestHash does: SHA256(POST + path + body)
+      const crypto = require('crypto');
+      const hash = crypto.createHash('sha256').update('POST').update('/api/test').digest('hex');
+
       (store as any).records.set('bad-json', {
         record: {
           status: 200,
           body: '{ malformed }',
           contentType: 'application/json',
           createdAt: new Date(),
-        }
+        },
+        requestHash: hash
       });
 
       const req = createRequest('POST', 'bad-json') as Request;
@@ -299,14 +337,16 @@ describe('Idempotency Middleware', () => {
       const store = new InMemoryIdempotencyStore({ ttlMs: 1 });
       await store.save('expired', { status: 200, body: 'ok', createdAt: new Date() });
       await new Promise(resolve => setTimeout(resolve, 5));
-      const result = await store.checkAndReserve('expired');
+      const result = await store.checkAndReserve('expired', 'any-hash');
       expect(result.state).toBe('new');
     });
 
     it('does not prune unexpired records in memory store', async () => {
       const store = new InMemoryIdempotencyStore({ ttlMs: 1000 });
+      // We need to reserve before saving to establish the hash context in the mock store
+      await store.checkAndReserve('alive', 'hash1');
       await store.save('alive', { status: 200, body: 'ok', createdAt: new Date() });
-      const result = await store.checkAndReserve('alive');
+      const result = await store.checkAndReserve('alive', 'hash1');
       expect(result.state).toBe('cached');
     });
   });
@@ -329,27 +369,40 @@ describe('Idempotency Middleware', () => {
       mockRepo.find.mockResolvedValue(null);
       mockRepo.reserve.mockResolvedValue(true);
 
-      const result = await store.checkAndReserve('new-key');
+      const result = await store.checkAndReserve('new-key', 'hash1');
       expect(result).toEqual({ state: 'new' });
-      expect(mockRepo.reserve).toHaveBeenCalledWith('new-key');
+      expect(mockRepo.reserve).toHaveBeenCalledWith('new-key', 'hash1');
     });
 
     it('recognizes in-flight keys from started status', async () => {
       mockRepo.find.mockResolvedValue({
         key: 'inflight-key',
         status: 'started',
+        request_hash: 'hash1',
         created_at: new Date(),
       });
 
-      const result = await store.checkAndReserve('inflight-key');
+      const result = await store.checkAndReserve('inflight-key', 'hash1');
       expect(result).toEqual({ state: 'inflight' });
+    });
+
+    it('recognizes mismatch for different hash', async () => {
+      mockRepo.find.mockResolvedValue({
+        key: 'key1',
+        status: 'completed',
+        request_hash: 'hash1',
+        created_at: new Date(),
+      });
+
+      const result = await store.checkAndReserve('key1', 'hash2');
+      expect(result).toEqual({ state: 'mismatch' });
     });
 
     it('recognizes in-flight keys from reservation failure', async () => {
         mockRepo.find.mockResolvedValue(null);
         mockRepo.reserve.mockResolvedValue(false);
   
-        const result = await store.checkAndReserve('raced-key');
+        const result = await store.checkAndReserve('raced-key', 'hash1');
         expect(result).toEqual({ state: 'inflight' });
       });
 
@@ -358,13 +411,14 @@ describe('Idempotency Middleware', () => {
       mockRepo.find.mockResolvedValue({
         key: 'cached-key',
         status: 'completed',
+        request_hash: 'hash1',
         response_status: 200,
         response_body: '{"ok":true}',
         response_content_type: 'application/json',
         created_at: date,
       });
 
-      const result = await store.checkAndReserve('cached-key');
+      const result = await store.checkAndReserve('cached-key', 'hash1');
       expect(result).toEqual({
         state: 'cached',
         record: {
@@ -374,6 +428,17 @@ describe('Idempotency Middleware', () => {
           createdAt: date,
         },
       });
+    });
+
+    it('saves records to repository', async () => {
+      const record = { status: 201, body: 'ok', createdAt: new Date() };
+      await store.save('key1', record);
+      expect(mockRepo.save).toHaveBeenCalledWith('key1', 201, 'ok', undefined);
+    });
+
+    it('deletes records on release', async () => {
+      await store.release('key1');
+      expect(mockRepo.delete).toHaveBeenCalledWith('key1');
     });
   });
 });

@@ -1,4 +1,5 @@
 import { NextFunction, Request, RequestHandler, Response } from 'express';
+import { createHash } from 'crypto';
 import { Errors } from '../lib/errors';
 import { IdempotencyRepository } from '../db/repositories/idempotencyRepository';
 
@@ -12,19 +13,17 @@ export interface IdempotencyRecord {
   createdAt: Date;
 }
 
-/**
- * Result of checking an idempotency key.
- */
 export type IdempotencyCheckResult =
   | { state: 'new' }
   | { state: 'inflight' }
+  | { state: 'mismatch' }
   | { state: 'cached'; record: IdempotencyRecord };
 
 /**
  * Interface for idempotency storage backends.
  */
 export interface IdempotencyStore {
-  checkAndReserve(key: string): Promise<IdempotencyCheckResult>;
+  checkAndReserve(key: string, requestHash: string): Promise<IdempotencyCheckResult>;
   save(key: string, record: IdempotencyRecord): Promise<void>;
   release(key: string): Promise<void>;
 }
@@ -35,12 +34,17 @@ export interface IdempotencyStore {
 export class PostgresIdempotencyStore implements IdempotencyStore {
   constructor(private readonly repository: IdempotencyRepository) {}
 
-  async checkAndReserve(key: string): Promise<IdempotencyCheckResult> {
+  async checkAndReserve(key: string, requestHash: string): Promise<IdempotencyCheckResult> {
     const existing = await this.repository.find(key);
 
     if (!existing) {
-      const reserved = await this.repository.reserve(key);
+      const reserved = await this.repository.reserve(key, requestHash);
       return reserved ? { state: 'new' } : { state: 'inflight' };
+    }
+
+    // Check for request mismatch
+    if (existing.request_hash && existing.request_hash !== requestHash) {
+      return { state: 'mismatch' };
     }
 
     if (existing.status === 'started') {
@@ -87,26 +91,38 @@ export class InMemoryIdempotencyStore implements IdempotencyStore {
     this.ttlMs = options.ttlMs;
   }
 
-  async checkAndReserve(key: string): Promise<IdempotencyCheckResult> {
+  async checkAndReserve(key: string, requestHash: string): Promise<IdempotencyCheckResult> {
     this.pruneExpired(key);
 
     const cached = this.records.get(key);
-    if (cached) return { state: 'cached', record: cached.record };
+    if (cached) {
+      if ((cached as any).requestHash !== requestHash) return { state: 'mismatch' };
+      return { state: 'cached', record: cached.record };
+    }
 
-    if (this.inFlight.has(key)) return { state: 'inflight' };
+    if (this.inFlight.has(key)) {
+      const inFlightHash = (this as any).inFlightHashes?.get(key);
+      if (inFlightHash && inFlightHash !== requestHash) return { state: 'mismatch' };
+      return { state: 'inflight' };
+    }
 
     this.inFlight.add(key);
+    if (!(this as any).inFlightHashes) (this as any).inFlightHashes = new Map<string, string>();
+    (this as any).inFlightHashes.set(key, requestHash);
     return { state: 'new' };
   }
 
   async save(key: string, record: IdempotencyRecord): Promise<void> {
+    const hash = (this as any).inFlightHashes?.get(key);
     this.inFlight.delete(key);
+    (this as any).inFlightHashes?.delete(key);
     const expiresAt = this.ttlMs ? Date.now() + this.ttlMs : undefined;
-    this.records.set(key, { record, expiresAt });
+    this.records.set(key, { record, expiresAt, requestHash: hash } as any);
   }
 
   async release(key: string): Promise<void> {
     this.inFlight.delete(key);
+    (this as any).inFlightHashes?.delete(key);
   }
 
   private pruneExpired(key: string): void {
@@ -145,8 +161,25 @@ function toHeaderString(value: unknown): string | undefined {
 function serializeBody(payload: unknown): string {
   if (Buffer.isBuffer(payload)) return payload.toString('utf-8');
   if (typeof payload === 'string') return payload;
-  if (payload === undefined) return '';
+  if (payload === undefined || payload === null) return '';
   return JSON.stringify(payload);
+}
+
+/**
+ * Generates a stable SHA-256 hash of the request.
+ */
+function generateRequestHash(req: Request): string {
+  const hash = createHash('sha256');
+  hash.update(req.method.toUpperCase());
+  hash.update(req.path);
+  
+  // Hash the body if present
+  if (req.body) {
+    const bodyStr = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+    hash.update(bodyStr);
+  }
+  
+  return hash.digest('hex');
 }
 
 function replayResponse(res: Response, record: IdempotencyRecord): void {
@@ -192,23 +225,31 @@ export function createIdempotencyMiddleware(
     }
 
     try {
-      const checkResult = await store.checkAndReserve(key);
+      const requestHash = generateRequestHash(req);
+      const checkResult = await store.checkAndReserve(key, requestHash);
+
+      if (checkResult.state === 'mismatch') {
+        logIdempotency({ key, state: 'mismatch', path: req.path, method: req.method });
+        return next(
+          Errors.badRequest('Idempotency key mismatch: this key was previously used for a different request.')
+        );
+      }
 
       if (checkResult.state === 'cached') {
-        logIdempotency({ key, state: 'cached', path: req.path });
+        logIdempotency({ key, state: 'cached', path: req.path, method: req.method });
         replayResponse(res, checkResult.record);
         return;
       }
 
       if (checkResult.state === 'inflight') {
-        logIdempotency({ key, state: 'inflight', path: req.path });
+        logIdempotency({ key, state: 'inflight', path: req.path, method: req.method });
         res.setHeader('Idempotency-Status', 'inflight');
         return next(
           Errors.conflict('A request with this idempotency key is already in progress.')
         );
       }
 
-      logIdempotency({ key, state: 'new', path: req.path });
+      logIdempotency({ key, state: 'new', path: req.path, method: req.method, hash: requestHash });
 
       // Hijack response methods to capture the body
       let responseBody = '';
