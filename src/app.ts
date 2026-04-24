@@ -8,11 +8,11 @@ import { SessionRepository } from './db/repositories/sessionRepository';
 import { createLogoutRouter } from './auth/logout/logoutRoute';
 import { createChangePasswordRouter } from './auth/changePassword/changePasswordRoute';
 import { createLoginRouter } from './auth/login/loginRoute';
-import { createHealthRouter } from './routes/health';
-import { UserRepository } from './db/repositories/userRepository';
-import { JwtIssuer, UserRole, UserRepository as IUserRepository, SessionRepository as ISessionRepository } from './auth/login/types';
-import { LoginService } from './auth/login/loginService';
-import { issueToken } from './lib/jwt';
+import { createRefreshRouter } from './auth/refresh/refreshRoute';
+import { RefreshService } from './auth/refresh/refreshService';
+import { RefreshTokenRepositoryAdapter } from './auth/refresh/repositoryAdapter';
+import { JwtTokenServiceAdapter } from './auth/refresh/tokenServiceAdapter';
+import { Logger } from './lib/logger';
 
 // Adapter to convert database User to login service UserRecord
 class UserRepositoryAdapter implements IUserRepository {
@@ -84,8 +84,15 @@ export function createApp() {
   const jwtIssuer = new JwtIssuerImpl();
   const loginService = new LoginService(new UserRepositoryAdapter(userRepository), new SessionRepositoryAdapter(sessionRepository), jwtIssuer);
 
+  // Refresh service
+  const refreshTokenRepository = new RefreshTokenRepositoryAdapter(sessionRepository);
+  const tokenService = new JwtTokenServiceAdapter();
+  const logger = new Logger({ serviceName: 'auth-refresh' });
+  const refreshService = new RefreshService(refreshTokenRepository, tokenService, pool, logger);
+
   // Auth and health routes
   app.use(createLoginRouter({ loginService }));
+  app.use(createRefreshRouter({ refreshService }));
   app.use(createLogoutRouter({ requireAuth, sessionRepository }));
   app.use(createChangePasswordRouter({ requireAuth, db: pool }));
   app.use('/api/v1/health', createHealthRouter(pool));
