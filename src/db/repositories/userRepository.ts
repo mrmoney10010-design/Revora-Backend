@@ -1,23 +1,28 @@
 import { Pool, QueryResult } from 'pg';
+import { UniqueConstraintError } from '../../lib/errors';
 
+/**
+ * Full user row — password_hash included for internal auth use only.
+ * Never expose this type in API responses.
+ */
 export interface User {
   id: string;
   email: string;
   password_hash: string;
   name?: string;
-  role: string;
-  created_at: Date;
-  updated_at: Date;
   role: 'startup' | 'investor';
   created_at: Date;
+  updated_at: Date;
 }
+
+/** Safe public shape — never includes password_hash */
+export type SafeUser = Omit<User, 'password_hash'>;
 
 export interface CreateUserInput {
   email: string;
   password_hash: string;
   name?: string;
-  role?: string;
-  role: 'startup' | 'investor';
+  role?: 'startup' | 'investor';
 }
 
 export interface UpdateUserInput {
@@ -27,79 +32,113 @@ export interface UpdateUserInput {
   role?: 'startup' | 'investor';
 }
 
+/**
+ * Inspects a caught error from a `pg` query and translates known PostgreSQL
+ * error codes into typed domain errors.  Always throws — never returns.
+ *
+ * - `23505` (`unique_violation`) → {@link UniqueConstraintError} with `field: "email"`
+ * - anything else → re-throws the original error unchanged
+ */
+function handlePgError(err: unknown): never {
+  if ((err as any).code === '23505') {
+    throw new UniqueConstraintError('email');
+  }
+  throw err;
+}
+
 export class UserRepository {
   constructor(private db: Pool) {}
 
+  /**
+   * Find a user by ID (includes password_hash for internal auth flows).
+   */
+  async findById(id: string): Promise<User | null> {
+    const query = `
+      SELECT id, email, password_hash, name, role, created_at, updated_at
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+    `;
+    const result: QueryResult<User> = await this.db.query(query, [id]);
+    return result.rows.length > 0 ? this.mapUser(result.rows[0]) : null;
+  }
+
+  // Alias used by routes/users.ts
+  async findUserById(id: string): Promise<User | null> {
+    return this.findById(id);
+  }
+
+  /**
+   * Find a user by email (used during login).
+   */
+  async findByEmail(email: string): Promise<User | null> {
+    const query = `
+      SELECT id, email, password_hash, name, role, created_at, updated_at
+      FROM users
+      WHERE email = $1
+      LIMIT 1
+    `;
+    const result: QueryResult<User> = await this.db.query(query, [email]);
+    return result.rows.length > 0 ? this.mapUser(result.rows[0]) : null;
+  }
+
+  // Alias
+  async findUserByEmail(email: string): Promise<User | null> {
+    return this.findByEmail(email);
+  }
+
+  /**
+   * Insert a new user row and return the created record.
+   *
+   * @throws {UniqueConstraintError} When the `email` column violates the
+   *   `UNIQUE` constraint (PostgreSQL error code `23505`).  This can happen
+   *   when two concurrent registrations race past the application-layer
+   *   duplicate check in `RegisterService`.
+   */
   async createUser(input: CreateUserInput): Promise<User> {
     const query = `
-      INSERT INTO users (
-        email,
-        password_hash,
-        name,
-        role,
-        created_at,
-        updated_at
-      )
+      INSERT INTO users (email, password_hash, name, role, created_at, updated_at)
       VALUES ($1, $2, $3, $4, NOW(), NOW())
       RETURNING *
     `;
-
     const values = [
       input.email,
       input.password_hash,
-      input.name,
-      input.role || 'startup_admin',
+      input.name ?? null,
+      input.role ?? 'startup',
     ];
-
-    const result: QueryResult<User> = await this.db.query(query, values);
-
-    if (result.rows.length === 0) {
-      throw new Error('Failed to create user');
+    let result: QueryResult<User>;
+    try {
+      result = await this.db.query(query, values);
+    } catch (err) {
+      handlePgError(err);
     }
-
-    return this.mapUser(result.rows[0]);
-  }
-
-  async findByEmail(email: string): Promise<User | null> {
-    const query = 'SELECT * FROM users WHERE email = $1';
-    const result: QueryResult<User> = await this.db.query(query, [email]);
-
-    if (result.rows.length === 0) {
-      return null;
-    }
-
-  async findUserById(id: string): Promise<User | null> {
-    const query = `SELECT * FROM users WHERE id = $1 LIMIT 1`;
-    const result: QueryResult = await this.db.query(query, [id]);
-    if (result.rows.length === 0) return null;
-    return this.mapUser(result.rows[0]);
-  }
-
-  async findUserByEmail(email: string): Promise<User | null> {
-    const query = `SELECT * FROM users WHERE email = $1 LIMIT 1`;
-    const result: QueryResult = await this.db.query(query, [email]);
-    if (result.rows.length === 0) return null;
-    return this.mapUser(result.rows[0]);
-  }
-
-  async createUser(input: CreateUserInput): Promise<User> {
-    const query = `
-      INSERT INTO users (email, password_hash, role, created_at)
-      VALUES ($1, $2, $3, NOW())
-      RETURNING *
-    `;
-
-    const values = [input.email, input.password_hash, input.role];
-    const result: QueryResult = await this.db.query(query, values);
     if (result.rows.length === 0) throw new Error('Failed to create user');
     return this.mapUser(result.rows[0]);
   }
 
+  /**
+   * Update an existing user's fields and return the updated record.
+   *
+   * @throws {UniqueConstraintError} When the new `email` value already exists
+   *   in the `users` table for a *different* user (PostgreSQL error code
+   *   `23505`).  Callers should catch this and return HTTP 409.
+   *
+   * @remarks
+   * **Same-email no-op**: If the caller passes the same email the user already
+   * holds, PostgreSQL will not raise a uniqueness violation (the row is simply
+   * updated in place with the identical value), so no error is thrown and the
+   * existing user record is returned normally.
+   *
+   * Callers are responsible for passing a normalised (lowercased + trimmed)
+   * email so that the database constraint and the application-layer check
+   * operate on the same canonical form.
+   */
   async updateUser(input: UpdateUserInput): Promise<User> {
-    // Build dynamic set clause
     const sets: string[] = [];
     const values: any[] = [];
     let idx = 1;
+
     if (input.email !== undefined) {
       sets.push(`email = $${idx++}`);
       values.push(input.email);
@@ -114,23 +153,40 @@ export class UserRepository {
     }
 
     if (sets.length === 0) {
-      // Nothing to update; return existing user
-      const existing = await this.findUserById(input.id);
+      const existing = await this.findById(input.id);
       if (!existing) throw new Error('User not found');
       return existing;
     }
 
-    const query = `
-      UPDATE users SET ${sets.join(', ')},
-        /* updated_at column not present by default; keep created_at unchanged */
-        /* If you add updated_at in future migrations, consider updating it here */
-      WHERE id = $${idx} RETURNING *
-    `;
+    sets.push(`updated_at = NOW()`);
     values.push(input.id);
 
-    const result: QueryResult = await this.db.query(query, values);
+    const query = `
+      UPDATE users
+      SET ${sets.join(', ')}
+      WHERE id = $${idx}
+      RETURNING *
+    `;
+    let result: QueryResult<User>;
+    try {
+      result = await this.db.query(query, values);
+    } catch (err) {
+      handlePgError(err);
+    }
     if (result.rows.length === 0) throw new Error('Failed to update user');
     return this.mapUser(result.rows[0]);
+  }
+
+  /**
+   * Update a user's password hash directly.
+   */
+  async updatePasswordHash(userId: string, newPasswordHash: string): Promise<void> {
+    const query = `
+      UPDATE users
+      SET password_hash = $1, updated_at = NOW()
+      WHERE id = $2
+    `;
+    await this.db.query(query, [newPasswordHash, userId]);
   }
 
   private mapUser(row: any): User {
@@ -138,12 +194,10 @@ export class UserRepository {
       id: row.id,
       email: row.email,
       password_hash: row.password_hash,
-      name: row.name,
-      role: row.role,
+      name: row.name ?? undefined,
+      role: row.role as 'startup' | 'investor',
       created_at: row.created_at,
       updated_at: row.updated_at,
-      role: row.role,
-      created_at: row.created_at,
     };
   }
 }

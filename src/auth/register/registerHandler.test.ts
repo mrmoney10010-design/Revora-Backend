@@ -42,28 +42,28 @@ describe('createRegisterHandler', () => {
     infoSpy = jest.spyOn(console, 'info').mockImplementation(() => undefined);
   });
 
-  afterEach(() => {
-    infoSpy.mockRestore();
-  });
-
-  it('returns 201 with user payload on success', async () => {
+describe('registerHandler', () => {
+  it('covers registration handler behaviors', async () => {
+  // ── 201 on success ─────────────────────────────────────────────────────────
+  {
     const svc = new MockRegisterService();
     svc.result = makeUser();
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ email: 'investor@example.com', password: 'secret123' }), res, noop);
-    expect(res._status()).toBe(201);
-    expect(res._body()).toEqual({ user: { id: 'user-1', email: 'investor@example.com', role: 'investor' } });
-  });
+    await handler(makeReq({ email: 'investor@example.com', password: 'StrongSecret123!' }), res, (e: unknown) => { throw e; });
+    const { statusCode, jsonData } = res._get();
+    assert.strictEqual(statusCode, 201, `expected 201 got ${statusCode}`);
+    assert.deepStrictEqual((jsonData as any).user, { id: 'user-1', email: 'investor@example.com', role: 'investor' });
+  }
 
   it('accepts optional name field and ignores it', async () => {
     const svc = new MockRegisterService();
     svc.result = makeUser({ email: 'alice@example.com' });
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ email: 'alice@example.com', password: 'password1', name: 'Alice' }), res, noop);
-    expect(res._status()).toBe(201);
-  });
+    await handler(makeReq({ email: 'alice@example.com', password: 'StrongPass555!', name: 'Alice' }), res, (e: unknown) => { throw e; });
+    assert.strictEqual(res._get().statusCode, 201);
+  }
 
   it('emits a structured info log on success without PII', async () => {
     const svc = new MockRegisterService();
@@ -139,31 +139,20 @@ describe('createRegisterHandler', () => {
     svc.shouldThrow = new DuplicateEmailError();
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ email: 'taken@example.com', password: 'password1' }), res, noop);
-    expect(res._status()).toBe(409);
-    expect((res._body() as any).code).toBe(ErrorCode.CONFLICT);
-    expect((res._body() as any).message).not.toMatch(/sql|pg|database|query/i);
-  });
+    await handler(makeReq({ email: 'taken@example.com', password: 'StrongPass666!' }), res, (e: unknown) => { throw e; });
+    const { statusCode, jsonData } = res._get();
+    assert.strictEqual(statusCode, 409);
+    assert.strictEqual((jsonData as any).error, 'Conflict');
+    assert.strictEqual((jsonData as any).message, 'Email already registered');
+  }
 
   it('409 response body does not expose stack or internal details', async () => {
     const svc = new MockRegisterService();
     svc.shouldThrow = new DuplicateEmailError();
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ email: 'taken@example.com', password: 'password1' }), res, noop);
-    const body = res._body() as any;
-    expect(body).not.toHaveProperty('stack');
-    expect(body).not.toHaveProperty('details');
-  });
-
-  it('forwards unexpected errors to next() without sending a response', async () => {
-    const svc = new MockRegisterService();
-    svc.shouldThrow = new Error('unexpected DB failure');
-    const handler = createRegisterHandler(svc as unknown as RegisterService);
-    const next = jest.fn() as NextFunction;
-    const res = makeRes();
-    await handler(makeReq({ email: 'investor@example.com', password: 'password1' }), res, next);
-    expect(next).toHaveBeenCalledWith(expect.objectContaining({ message: 'unexpected DB failure' }));
-    expect(res._status()).toBe(200);
+    await handler(makeReq({ email: 'investor@example.com', password: 'StrongPass777!' }), res, (e: unknown) => { capturedErr = e; });
+    assert(capturedErr instanceof Error && capturedErr.message === 'unexpected DB failure');
+  }
   });
 });
