@@ -10,13 +10,922 @@ import {
 import { closePool } from '../db/client';
 import { ErrorCode } from '../lib/errors';
 import {
+  calculateLag,
+  calculateUptimeSeconds,
   createHealthRouter,
+  determineHealthStatus,
+  getHealthLagThreshold,
+  getIndexerStartTime,
   healthReadyHandler,
+  INDEXER_START_TIME,
   mapHealthDependencyFailure,
 } from './health';
 
 afterAll(async () => {
   await closePool();
+});
+
+describe('calculateLag', () => {
+  it('calculates correct lag when indexer is behind', () => {
+    const result = calculateLag(1000, 950);
+    
+    expect(result.lagLedgers).toBe(50);
+    expect(result.lagSeconds).toBe(250); // 50 * 5 seconds
+  });
+
+  it('returns zero lag when indexer is caught up', () => {
+    const result = calculateLag(1000, 1000);
+    
+    expect(result.lagLedgers).toBe(0);
+    expect(result.lagSeconds).toBe(0);
+  });
+
+  it('clamps negative lag to zero when last indexed is ahead', () => {
+    const result = calculateLag(900, 1000);
+    
+    expect(result.lagLedgers).toBe(0);
+    expect(result.lagSeconds).toBe(0);
+  });
+
+  it('handles large lag values correctly', () => {
+    const result = calculateLag(1000000, 500000);
+    
+    expect(result.lagLedgers).toBe(500000);
+    expect(result.lagSeconds).toBe(2500000); // 500000 * 5 seconds
+  });
+
+  it('handles zero ledger values', () => {
+    const result = calculateLag(0, 0);
+    
+    expect(result.lagLedgers).toBe(0);
+    expect(result.lagSeconds).toBe(0);
+  });
+
+  it('calculates lag of exactly one ledger', () => {
+    const result = calculateLag(1001, 1000);
+    
+    expect(result.lagLedgers).toBe(1);
+    expect(result.lagSeconds).toBe(5);
+  });
+
+  it('uses 5-second ledger close time constant', () => {
+    // Verify the 5-second constant is used correctly
+    const result = calculateLag(100, 90);
+    
+    expect(result.lagSeconds).toBe(result.lagLedgers * 5);
+  });
+});
+
+describe('determineHealthStatus', () => {
+  it('returns "ok" when lag is below threshold and no errors', () => {
+    const status = determineHealthStatus(50, 100, false);
+    
+    expect(status).toBe('ok');
+  });
+
+  it('returns "ok" when lag equals threshold and no errors', () => {
+    const status = determineHealthStatus(100, 100, false);
+    
+    expect(status).toBe('ok');
+  });
+
+  it('returns "degraded" when lag exceeds threshold', () => {
+    const status = determineHealthStatus(150, 100, false);
+    
+    expect(status).toBe('degraded');
+  });
+
+  it('returns "degraded" when hasErrors is true regardless of lag', () => {
+    const status = determineHealthStatus(10, 100, true);
+    
+    expect(status).toBe('degraded');
+  });
+
+  it('returns "degraded" when hasErrors is true even with zero lag', () => {
+    const status = determineHealthStatus(0, 100, true);
+    
+    expect(status).toBe('degraded');
+  });
+
+  it('returns "ok" when lag is zero and no errors', () => {
+    const status = determineHealthStatus(0, 100, false);
+    
+    expect(status).toBe('ok');
+  });
+
+  it('handles custom threshold values correctly', () => {
+    expect(determineHealthStatus(200, 200, false)).toBe('ok');
+    expect(determineHealthStatus(201, 200, false)).toBe('degraded');
+  });
+
+  it('handles very large lag values', () => {
+    const status = determineHealthStatus(1000000, 100, false);
+    
+    expect(status).toBe('degraded');
+  });
+});
+
+describe('getHealthLagThreshold', () => {
+  const originalEnv = process.env.HEALTH_LAG_THRESHOLD;
+
+  afterEach(() => {
+    if (originalEnv !== undefined) {
+      process.env.HEALTH_LAG_THRESHOLD = originalEnv;
+    } else {
+      delete process.env.HEALTH_LAG_THRESHOLD;
+    }
+  });
+
+  it('returns default threshold of 100 when env var is not set', () => {
+    delete process.env.HEALTH_LAG_THRESHOLD;
+    
+    expect(getHealthLagThreshold()).toBe(100);
+  });
+
+  it('returns custom threshold when env var is set to valid positive integer', () => {
+    process.env.HEALTH_LAG_THRESHOLD = '200';
+    
+    expect(getHealthLagThreshold()).toBe(200);
+  });
+
+  it('returns custom threshold for very large values', () => {
+    process.env.HEALTH_LAG_THRESHOLD = '10000';
+    
+    expect(getHealthLagThreshold()).toBe(10000);
+  });
+
+  it('returns default threshold when env var is empty string', () => {
+    process.env.HEALTH_LAG_THRESHOLD = '';
+    
+    expect(getHealthLagThreshold()).toBe(100);
+  });
+
+  it('returns default threshold when env var is not a valid number', () => {
+    process.env.HEALTH_LAG_THRESHOLD = 'not-a-number';
+    
+    expect(getHealthLagThreshold()).toBe(100);
+  });
+
+  it('returns default threshold when env var is zero', () => {
+    process.env.HEALTH_LAG_THRESHOLD = '0';
+    
+    expect(getHealthLagThreshold()).toBe(100);
+  });
+
+  it('returns default threshold when env var is negative', () => {
+    process.env.HEALTH_LAG_THRESHOLD = '-50';
+    
+    expect(getHealthLagThreshold()).toBe(100);
+  });
+
+  it('returns default threshold when env var is a decimal number', () => {
+    process.env.HEALTH_LAG_THRESHOLD = '100.5';
+    
+    expect(getHealthLagThreshold()).toBe(100);
+  });
+
+  it('handles threshold of 1 correctly', () => {
+    process.env.HEALTH_LAG_THRESHOLD = '1';
+    
+    expect(getHealthLagThreshold()).toBe(1);
+  });
+
+  it('ignores whitespace in env var value', () => {
+    process.env.HEALTH_LAG_THRESHOLD = '  250  ';
+    
+    expect(getHealthLagThreshold()).toBe(250);
+  });
+});
+
+describe('getIndexerStartTime', () => {
+  it('returns the INDEXER_START_TIME constant', () => {
+    const startTime = getIndexerStartTime();
+    
+    expect(startTime).toBe(INDEXER_START_TIME);
+    expect(startTime).toBeInstanceOf(Date);
+  });
+
+  it('returns the same Date object on multiple calls', () => {
+    const firstCall = getIndexerStartTime();
+    const secondCall = getIndexerStartTime();
+    
+    expect(firstCall).toBe(secondCall);
+  });
+
+  it('returns a valid Date object', () => {
+    const startTime = getIndexerStartTime();
+    
+    expect(startTime.getTime()).not.toBeNaN();
+    expect(startTime.toISOString()).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  });
+});
+
+describe('calculateUptimeSeconds', () => {
+  it('calculates uptime correctly for a process started 5 minutes ago', () => {
+    const startTime = new Date(Date.now() - 5 * 60 * 1000);
+    const uptime = calculateUptimeSeconds(startTime);
+    
+    // Allow for small timing variations (within 1 second)
+    expect(uptime).toBeGreaterThanOrEqual(299);
+    expect(uptime).toBeLessThanOrEqual(301);
+  });
+
+  it('returns 0 for a process that just started', () => {
+    const startTime = new Date();
+    const uptime = calculateUptimeSeconds(startTime);
+    
+    expect(uptime).toBe(0);
+  });
+
+  it('calculates uptime correctly for a process started 1 hour ago', () => {
+    const startTime = new Date(Date.now() - 60 * 60 * 1000);
+    const uptime = calculateUptimeSeconds(startTime);
+    
+    // Allow for small timing variations (within 1 second)
+    expect(uptime).toBeGreaterThanOrEqual(3599);
+    expect(uptime).toBeLessThanOrEqual(3601);
+  });
+
+  it('calculates uptime correctly for a process started 1 day ago', () => {
+    const startTime = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const uptime = calculateUptimeSeconds(startTime);
+    
+    // Allow for small timing variations (within 1 second)
+    expect(uptime).toBeGreaterThanOrEqual(86399);
+    expect(uptime).toBeLessThanOrEqual(86401);
+  });
+
+  it('returns an integer value (floors fractional seconds)', () => {
+    const startTime = new Date(Date.now() - 1500); // 1.5 seconds ago
+    const uptime = calculateUptimeSeconds(startTime);
+    
+    expect(Number.isInteger(uptime)).toBe(true);
+    expect(uptime).toBe(1);
+  });
+
+  it('handles very small uptime values correctly', () => {
+    const startTime = new Date(Date.now() - 100); // 100ms ago
+    const uptime = calculateUptimeSeconds(startTime);
+    
+    expect(uptime).toBe(0);
+  });
+
+  it('calculates uptime for a specific timestamp correctly', () => {
+    const startTime = new Date('2024-01-01T00:00:00.000Z');
+    const currentTime = new Date('2024-01-01T00:05:30.000Z');
+    
+    // Mock the Date constructor to return a specific time
+    const RealDate = Date;
+    global.Date = class extends RealDate {
+      constructor(...args: any[]) {
+        if (args.length === 0) {
+          super(currentTime.getTime());
+        } else {
+          super(...args);
+        }
+      }
+      static now() {
+        return currentTime.getTime();
+      }
+    } as any;
+    
+    const uptime = calculateUptimeSeconds(startTime);
+    
+    expect(uptime).toBe(330); // 5 minutes 30 seconds = 330 seconds
+    
+    // Restore original Date
+    global.Date = RealDate;
+  });
+
+  it('returns non-negative values', () => {
+    const startTime = new Date(Date.now() - 10000);
+    const uptime = calculateUptimeSeconds(startTime);
+    
+    expect(uptime).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('healthIndexerHandler - comprehensive unit tests', () => {
+  it('returns ok status when lag is below threshold', async () => {
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    const mockDb = {
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 950 }] })
+        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
+    };
+
+    const startTime = new Date(Date.now() - 300000); // 5 minutes ago
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: mockRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe('ok');
+    expect(response.body.lag_ledgers).toBe(50);
+    expect(response.body.lag_seconds).toBe(250);
+  });
+
+  it('returns degraded status when lag exceeds threshold', async () => {
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    const mockDb = {
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 800 }] })
+        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: mockRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(503);
+    expect(response.body.status).toBe('degraded');
+    expect(response.body.lag_ledgers).toBe(200);
+    expect(response.body.lag_seconds).toBe(1000);
+  });
+
+  it('returns HTTP 200 for ok status', async () => {
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    const mockDb = {
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 990 }] })
+        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: mockRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe('ok');
+  });
+
+  it('returns HTTP 503 for degraded status', async () => {
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    const mockDb = {
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 700 }] })
+        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: mockRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(503);
+    expect(response.body.status).toBe('degraded');
+  });
+
+  it('clamps negative lag to zero', async () => {
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 900 }),
+    };
+
+    const mockDb = {
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 1000 }] })
+        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: mockRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(200);
+    expect(response.body.lag_ledgers).toBe(0);
+    expect(response.body.lag_seconds).toBe(0);
+  });
+
+  it('uses default threshold when HEALTH_LAG_THRESHOLD not set', async () => {
+    const originalEnv = process.env.HEALTH_LAG_THRESHOLD;
+    delete process.env.HEALTH_LAG_THRESHOLD;
+
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    const mockDb = {
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 899 }] })
+        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    // Don't pass lagThreshold, let it use default from environment
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: mockRpcClient,
+      startTime,
+    }));
+
+    const response = await request(app).get('/health');
+
+    // Lag is 101, default threshold is 100, so should be degraded
+    expect(response.status).toBe(503);
+    expect(response.body.status).toBe('degraded');
+    expect(response.body.lag_ledgers).toBe(101);
+
+    // Restore environment
+    if (originalEnv !== undefined) {
+      process.env.HEALTH_LAG_THRESHOLD = originalEnv;
+    }
+  });
+
+  it('uses custom threshold from environment variable', async () => {
+    const originalEnv = process.env.HEALTH_LAG_THRESHOLD;
+    process.env.HEALTH_LAG_THRESHOLD = '200';
+
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    const mockDb = {
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 850 }] })
+        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    // Don't pass lagThreshold, let it read from environment
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: mockRpcClient,
+      startTime,
+    }));
+
+    const response = await request(app).get('/health');
+
+    // Lag is 150, custom threshold is 200, so should be ok
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe('ok');
+    expect(response.body.lag_ledgers).toBe(150);
+
+    // Restore environment
+    if (originalEnv !== undefined) {
+      process.env.HEALTH_LAG_THRESHOLD = originalEnv;
+    } else {
+      delete process.env.HEALTH_LAG_THRESHOLD;
+    }
+  });
+
+  it('handles RPC client failure gracefully', async () => {
+    const failingRpcClient = {
+      getLatestLedger: jest.fn().mockRejectedValue(new Error('Connection timeout')),
+    };
+
+    const mockDb = {
+      query: jest.fn().mockResolvedValue({ rows: [{ last_indexed_ledger: 950 }] }),
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: failingRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(503);
+    expect(response.body.status).toBe('degraded');
+    expect(response.body.error).toContain('RPC client unavailable');
+    expect(response.body.uptime_seconds).toBeGreaterThanOrEqual(0);
+    expect(response.body.timestamp).toBeDefined();
+  });
+
+  it('handles database query failure gracefully', async () => {
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    const failingDb = {
+      query: jest.fn().mockRejectedValue(new Error('Connection refused')),
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: failingDb,
+      rpcClient: mockRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(503);
+    expect(response.body.status).toBe('degraded');
+    expect(response.body.error).toContain('Database query failed');
+  });
+
+  it('verifies uptime calculation accuracy', async () => {
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    const mockDb = {
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 950 }] })
+        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
+    };
+
+    // Start time 10 minutes ago
+    const startTime = new Date(Date.now() - 10 * 60 * 1000);
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: mockRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(200);
+    // Allow for small timing variations (within 2 seconds)
+    expect(response.body.uptime_seconds).toBeGreaterThanOrEqual(598);
+    expect(response.body.uptime_seconds).toBeLessThanOrEqual(602);
+  });
+
+  it('verifies event count queries return correct values', async () => {
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    const mockDb = {
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 950 }] })
+        .mockResolvedValueOnce({ rows: [{ count: '42' }] })  // proposals
+        .mockResolvedValueOnce({ rows: [{ count: '123' }] }) // votes
+        .mockResolvedValueOnce({ rows: [{ count: '17' }] }), // delegates
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: mockRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(200);
+    expect(response.body.total_proposals_indexed).toBe(42);
+    expect(response.body.total_votes_indexed).toBe(123);
+    expect(response.body.total_delegates_indexed).toBe(17);
+  });
+
+  it('completes successfully when all queries finish within 5 seconds', async () => {
+    const fastRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    const mockDb = {
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 950 }] })
+        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
+    };
+
+    const startTime = new Date(Date.now() - 300000); // 5 minutes ago
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: fastRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe('ok');
+    expect(response.body.current_ledger).toBe(1000);
+    expect(response.body.last_indexed_ledger).toBe(950);
+    expect(response.body.lag_ledgers).toBe(50);
+    expect(response.body.lag_seconds).toBe(250);
+    expect(response.body.total_proposals_indexed).toBe(10);
+    expect(response.body.total_votes_indexed).toBe(20);
+    expect(response.body.total_delegates_indexed).toBe(5);
+    expect(response.body.uptime_seconds).toBeGreaterThanOrEqual(299);
+    expect(response.body.timestamp).toBeDefined();
+    expect(response.body.error).toBeUndefined();
+  });
+
+  it('handles proposals count query failure', async () => {
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    let callCount = 0;
+    const mockDb = {
+      query: jest.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          // First call: indexer_state query succeeds
+          return Promise.resolve({ rows: [{ last_indexed_ledger: 950 }] });
+        } else if (callCount === 2) {
+          // Second call: proposals query fails
+          return Promise.reject(new Error('Proposals table error'));
+        }
+        // Shouldn't reach here
+        return Promise.resolve({ rows: [{ count: '0' }] });
+      }),
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: mockRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(503);
+    expect(response.body.status).toBe('degraded');
+    expect(response.body.error).toContain('Proposals count query failed');
+  });
+
+  it('handles votes count query failure', async () => {
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    let callCount = 0;
+    const mockDb = {
+      query: jest.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          // First call: indexer_state query succeeds
+          return Promise.resolve({ rows: [{ last_indexed_ledger: 950 }] });
+        } else if (callCount === 2) {
+          // Second call: proposals query succeeds
+          return Promise.resolve({ rows: [{ count: '10' }] });
+        } else if (callCount === 3) {
+          // Third call: votes query fails
+          return Promise.reject(new Error('Votes table error'));
+        }
+        // Shouldn't reach here
+        return Promise.resolve({ rows: [{ count: '0' }] });
+      }),
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: mockRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(503);
+    expect(response.body.status).toBe('degraded');
+    expect(response.body.error).toContain('Votes count query failed');
+  });
+
+  it('handles delegates count query failure', async () => {
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    const mockDb = {
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 950 }] })
+        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
+        .mockRejectedValueOnce(new Error('Delegates table error')),
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: mockRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(503);
+    expect(response.body.status).toBe('degraded');
+    expect(response.body.error).toContain('Delegates count query failed');
+  });
+
+  it('returns all required response fields with correct types', async () => {
+    const mockRpcClient = {
+      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
+    };
+
+    const mockDb = {
+      query: jest.fn()
+        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 950 }] })
+        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: mockRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    // Verify all required fields exist
+    expect(response.body).toHaveProperty('status');
+    expect(response.body).toHaveProperty('last_indexed_ledger');
+    expect(response.body).toHaveProperty('current_ledger');
+    expect(response.body).toHaveProperty('lag_ledgers');
+    expect(response.body).toHaveProperty('lag_seconds');
+    expect(response.body).toHaveProperty('total_proposals_indexed');
+    expect(response.body).toHaveProperty('total_votes_indexed');
+    expect(response.body).toHaveProperty('total_delegates_indexed');
+    expect(response.body).toHaveProperty('uptime_seconds');
+    expect(response.body).toHaveProperty('timestamp');
+
+    // Verify types
+    expect(['ok', 'degraded']).toContain(response.body.status);
+    expect(typeof response.body.last_indexed_ledger).toBe('number');
+    expect(typeof response.body.current_ledger).toBe('number');
+    expect(typeof response.body.lag_ledgers).toBe('number');
+    expect(typeof response.body.lag_seconds).toBe('number');
+    expect(typeof response.body.total_proposals_indexed).toBe('number');
+    expect(typeof response.body.total_votes_indexed).toBe('number');
+    expect(typeof response.body.total_delegates_indexed).toBe('number');
+    expect(typeof response.body.uptime_seconds).toBe('number');
+    expect(typeof response.body.timestamp).toBe('string');
+
+    // Verify non-negative values
+    expect(response.body.last_indexed_ledger).toBeGreaterThanOrEqual(0);
+    expect(response.body.current_ledger).toBeGreaterThanOrEqual(0);
+    expect(response.body.lag_ledgers).toBeGreaterThanOrEqual(0);
+    expect(response.body.lag_seconds).toBeGreaterThanOrEqual(0);
+    expect(response.body.total_proposals_indexed).toBeGreaterThanOrEqual(0);
+    expect(response.body.total_votes_indexed).toBeGreaterThanOrEqual(0);
+    expect(response.body.total_delegates_indexed).toBeGreaterThanOrEqual(0);
+    expect(response.body.uptime_seconds).toBeGreaterThanOrEqual(0);
+
+    // Verify ISO 8601 timestamp format
+    expect(response.body.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(() => new Date(response.body.timestamp).toISOString()).not.toThrow();
+  });
+
+  it('includes error field only when status is degraded', async () => {
+    const failingRpcClient = {
+      getLatestLedger: jest.fn().mockRejectedValue(new Error('Network error')),
+    };
+
+    const mockDb = {
+      query: jest.fn().mockResolvedValue({ rows: [] }),
+    };
+
+    const startTime = new Date();
+
+    const app = express();
+    const { healthIndexerHandler } = await import('./health');
+    
+    app.get('/health', healthIndexerHandler({
+      db: mockDb,
+      rpcClient: failingRpcClient,
+      startTime,
+      lagThreshold: 100,
+    }));
+
+    const response = await request(app).get('/health');
+
+    expect(response.status).toBe(503);
+    expect(response.body.status).toBe('degraded');
+    expect(response.body.error).toBeDefined();
+    expect(typeof response.body.error).toBe('string');
+    expect(response.body.error.length).toBeGreaterThan(0);
+  });
 });
 
 describe('classifyStellarRPCFailure', () => {
