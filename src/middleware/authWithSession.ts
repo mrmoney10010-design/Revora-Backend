@@ -2,6 +2,8 @@ import { Request, Response, NextFunction, RequestHandler } from 'express';
 import { verifyToken } from '../lib/jwt';
 import { SessionRepository } from '../db/repositories/sessionRepository';
 import { UserRole } from '../auth/login/types';
+import { Errors } from '../lib/errors';
+import { globalLogger } from '../lib/logger';
 
 export interface AuthContext {
     userId: string;
@@ -20,23 +22,41 @@ export interface AuthenticatedRequest extends Request {
 export const createRequireAuthWithSession = (
     sessionRepository: SessionRepository,
 ): RequestHandler => {
+    if (!sessionRepository) {
+        throw new Error('SessionRepository is required');
+    }
     return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-        const authHeader = req.headers.authorization;
-
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            res.status(401).json({ error: 'Unauthorized', message: 'Missing or invalid token' });
-            return;
-        }
-
-        const token = authHeader.slice(7);
-
         try {
-            const payload = verifyToken(token);
+            const authHeader = req.headers.authorization;
+            const requestId = (req as any).requestId;
+
+            if (!authHeader || !authHeader.startsWith('Bearer ')) {
+                globalLogger.warn('Auth failure: Missing or invalid token', { requestId });
+                next(Errors.unauthorized('Missing or invalid token'));
+                return;
+            }
+
+            const token = authHeader.slice(7);
+
+            let payload;
+            try {
+                payload = verifyToken(token);
+            } catch (error) {
+                globalLogger.warn('Auth failure: Invalid or expired token', { 
+                    requestId, 
+                    error: error instanceof Error ? error.message : String(error) 
+                });
+                next(Errors.unauthorized('Invalid or expired token'));
+                return;
+            }
+
             const sessionId = payload.sid as string;
             const userId = payload.sub;
+            const role = payload.role as UserRole;
 
-            if (!sessionId) {
-                res.status(401).json({ error: 'Unauthorized', message: 'Token missing session identifier' });
+            if (!sessionId || !userId) {
+                globalLogger.warn('Auth failure: Token missing identifiers', { requestId, userId });
+                next(Errors.unauthorized('Token missing identifiers'));
                 return;
             }
 
@@ -44,29 +64,33 @@ export const createRequireAuthWithSession = (
             const session = await sessionRepository.findById(sessionId);
 
             if (!session) {
-                res.status(401).json({ error: 'Unauthorized', message: 'Session not found' });
+                globalLogger.warn('Auth failure: Session not found', { requestId, userId, sessionId });
+                next(Errors.unauthorized('Session not found'));
                 return;
             }
 
             if (session.revoked_at) {
-                res.status(401).json({ error: 'Unauthorized', message: 'Session has been revoked' });
+                globalLogger.warn('Auth failure: Session revoked', { requestId, userId, sessionId });
+                next(Errors.unauthorized('Session has been revoked'));
                 return;
             }
 
             if (new Date(session.expires_at) < new Date()) {
-                res.status(401).json({ error: 'Unauthorized', message: 'Session has expired' });
+                globalLogger.warn('Auth failure: Session expired', { requestId, userId, sessionId });
+                next(Errors.unauthorized('Session has expired'));
                 return;
             }
 
             (req as AuthenticatedRequest).auth = {
                 userId,
                 sessionId,
-                role: payload.role as UserRole,
+                role,
             };
 
+            globalLogger.info('Auth success', { requestId, userId, role, sessionId });
             next();
         } catch (error) {
-            res.status(401).json({ error: 'Unauthorized', message: 'Invalid or expired token' });
+            next(error);
         }
     };
 };

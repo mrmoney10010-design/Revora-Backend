@@ -1,5 +1,6 @@
 import { ErrorRequestHandler, NextFunction, Request, Response } from 'express';
 import { AppError, ErrorCode, ErrorResponse, Errors } from '../lib/errors';
+import { globalLogger } from '../lib/logger';
 
 interface StructuredErrorLogEntry {
   type: 'error';
@@ -71,7 +72,10 @@ export const errorHandler: ErrorRequestHandler = (
   const mapped = mapUnknownErrorToAppError(err);
   const logEntry = createStructuredErrorLogEntry(err, requestId);
 
-  console.error(JSON.stringify(logEntry));
+  globalLogger.error(mapped.message, {
+    ...logEntry,
+    error: err instanceof Error ? err : undefined,
+  });
 
   const body: ErrorResponse = mapped.expose
     ? mapped.toResponse(requestId)
