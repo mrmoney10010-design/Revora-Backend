@@ -1,9 +1,6 @@
-import assert from 'assert';
 import { createHash } from 'node:crypto';
 import { RegisterService, DuplicateEmailError } from './registerService';
 import { IUserRepository, RegisteredUser } from './types';
-
-// ─── In-memory fake repository ───────────────────────────────────────────────
 
 class FakeUserRepository implements IUserRepository {
   private users: Map<string, RegisteredUser & { password_hash: string }> = new Map();
@@ -29,92 +26,63 @@ class FakeUserRepository implements IUserRepository {
   }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
-
-(async function run() {
-  // ── Success: creates investor with hashed password ──────────────────────────
-  {
+describe('RegisterService', () => {
+  it('creates investor with hashed password and normalized email', async () => {
     const repo = new FakeUserRepository();
     const svc = new RegisterService(repo);
     const user = await svc.register('Alice@Example.COM', 'secret123');
 
-    assert(user.id, 'user should have an id');
-    assert.strictEqual(user.email, 'alice@example.com', 'email should be lowercased + trimmed');
-    assert.strictEqual(user.role, 'investor', 'role must be investor');
+    expect(user.id).toBeDefined();
+    expect(user.email).toBe('alice@example.com');
+    expect(user.role).toBe('investor');
 
     const expectedHash = createHash('sha256').update('secret123').digest('hex');
-    assert.strictEqual(repo.getStoredHash('alice@example.com'), expectedHash, 'password must be SHA-256 hashed');
-  }
+    expect(repo.getStoredHash('alice@example.com')).toBe(expectedHash);
+  });
 
-  // ── Email normalisation: trim whitespace ─────────────────────────────────────
-  {
+  it('normalizes email by trimming whitespace', async () => {
     const repo = new FakeUserRepository();
     const svc = new RegisterService(repo);
     const user = await svc.register('  bob@example.com  ', 'password1');
-    assert.strictEqual(user.email, 'bob@example.com', 'leading/trailing spaces must be stripped');
-  }
+    expect(user.email).toBe('bob@example.com');
+  });
 
-  // ── Duplicate email throws DuplicateEmailError ────────────────────────────────
-  {
+  it('throws DuplicateEmailError when email is already registered', async () => {
     const repo = new FakeUserRepository();
     const svc = new RegisterService(repo);
     await svc.register('carol@example.com', 'password1');
 
-    let threw = false;
-    try {
-      await svc.register('carol@example.com', 'different-password');
-    } catch (err) {
-      threw = true;
-      assert(err instanceof DuplicateEmailError, 'should throw DuplicateEmailError');
-      assert.strictEqual((err as DuplicateEmailError).message, 'Email already registered');
-    }
-    assert(threw, 'should have thrown');
-  }
+    await expect(svc.register('carol@example.com', 'different-password'))
+      .rejects.toThrow(DuplicateEmailError);
+  });
 
-  // ── Duplicate email is case-insensitive ───────────────────────────────────────
-  {
+  it('handles case-insensitive duplicate emails', async () => {
     const repo = new FakeUserRepository();
     const svc = new RegisterService(repo);
     await svc.register('Dave@Example.com', 'password1');
 
-    let threw = false;
-    try {
-      await svc.register('dave@example.com', 'password2');
-    } catch (err) {
-      threw = true;
-      assert(err instanceof DuplicateEmailError, 'duplicate check is case-insensitive');
-    }
-    assert(threw, 'should have thrown on case-variant duplicate');
-  }
+    await expect(svc.register('dave@example.com', 'password2'))
+      .rejects.toThrow(DuplicateEmailError);
+  });
 
-  // ── Different users can register independently ──────────────────────────────
-  {
+  it('allows different users to register independently', async () => {
     const repo = new FakeUserRepository();
     const svc = new RegisterService(repo);
     const u1 = await svc.register('eve@example.com', 'password-eve');
     const u2 = await svc.register('frank@example.com', 'password-frank');
 
-    assert.notStrictEqual(u1.id, u2.id, 'each user gets a unique id');
-    assert.strictEqual(u1.role, 'investor');
-    assert.strictEqual(u2.role, 'investor');
-  }
+    expect(u1.id).not.toBe(u2.id);
+    expect(u1.role).toBe('investor');
+    expect(u2.role).toBe('investor');
+  });
 
-  // ── Repository error propagates ───────────────────────────────────────────────
-  {
+  it('propagates repository errors', async () => {
     const failRepo: IUserRepository = {
       async findByEmail() { return null; },
       async createUser() { throw new Error('DB connection lost'); },
     };
     const svc = new RegisterService(failRepo);
-    let threw = false;
-    try {
-      await svc.register('grace@example.com', 'password1');
-    } catch (err) {
-      threw = true;
-      assert(err instanceof Error && err.message === 'DB connection lost');
-    }
-    assert(threw, 'DB error should propagate');
-  }
-
-  console.log('registerService tests passed');
-})();
+    await expect(svc.register('grace@example.com', 'password1'))
+      .rejects.toThrow('DB connection lost');
+  });
+});

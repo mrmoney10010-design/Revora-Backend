@@ -44,7 +44,7 @@ export function sanitizeString(input: unknown, opts?: SanitizeOptions): string {
   if (o.collapseWhitespace) {
     if (o.allowNewlines) {
       s = s.replace(/[ \t\f\v\r]+/g, ' ');
-      s = s.replace(/ *\n+ */g, '\n');
+      s = s.replace(/ *\n */g, '\n');
       s = s.replace(/\n{3,}/g, '\n\n');
     } else {
       s = s.replace(/\s+/g, ' ');

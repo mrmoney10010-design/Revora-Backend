@@ -138,7 +138,11 @@ describe('AuditLogRepository', () => {
       const result = await repository.getAuditLogsByUser(userId);
 
       expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringContaining('SELECT * FROM audit_logs WHERE user_id = $1'),
+        expect.stringContaining('SELECT * FROM audit_logs'),
+        [userId, 50]
+      );
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('WHERE user_id = $1'),
         [userId, 50]
       );
       expect(result).toHaveLength(1);
@@ -173,7 +177,11 @@ describe('AuditLogRepository', () => {
       const result = await repository.getAuditLogsByAction(action);
 
       expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringContaining('SELECT * FROM audit_logs WHERE action = $1'),
+        expect.stringContaining('SELECT * FROM audit_logs'),
+        [action, 50]
+      );
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('WHERE action = $1'),
         [action, 50]
       );
       expect(result).toHaveLength(1);

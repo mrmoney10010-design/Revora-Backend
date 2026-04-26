@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
+import { requireIdempotency } from '../middleware/configuredIdempotency';
 import { Pool } from 'pg';
 import { InvestmentRepository } from '../db/repositories/investmentRepository';
 import { requireInvestor, AuthenticatedRequest } from '../middleware/auth';
@@ -23,7 +24,7 @@ export function createInvestmentsRouter(db: Pool): Router {
    *   amount - Amount to invest as a string (required, positive number)
    *   asset - Asset code (e.g., 'USDC') (required)
    */
-  router.post('/', requireInvestor, async (req: Request, res: Response, next: NextFunction) => {
+  router.post('/', requireInvestor, requireIdempotency, async (req: Request, res: Response, next: NextFunction) => {
     const authenticatedReq = req as AuthenticatedRequest;
     
     // Type guard to ensure user is defined

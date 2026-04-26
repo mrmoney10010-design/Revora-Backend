@@ -23,17 +23,21 @@ describe("jwt utilities", () => {
     });
 
     it("should throw error when JWT_SECRET is not set", () => {
+      const old = process.env.JWT_SECRET;
       delete process.env.JWT_SECRET;
       expect(() => getJwtSecret()).toThrow(
         "JWT_SECRET environment variable is not set",
       );
+      process.env.JWT_SECRET = old;
     });
 
     it("should throw error when JWT_SECRET is too short", () => {
+      const old = process.env.JWT_SECRET;
       process.env.JWT_SECRET = "short";
       expect(() => getJwtSecret()).toThrow(
         "JWT_SECRET must be at least 32 characters for security",
       );
+      process.env.JWT_SECRET = old;
     });
   });
 

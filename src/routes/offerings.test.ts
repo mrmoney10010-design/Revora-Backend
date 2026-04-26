@@ -1,4 +1,3 @@
-import assert from 'assert';
 import { createOfferingHandlers } from './offerings';
 
 class MockOfferingRepo {
@@ -17,6 +16,9 @@ class MockOfferingRepo {
     const list = await this.listByIssuer(issuerId, opts);
     return list.length;
   }
+  async getById(id: string) {
+    return this.rows.find(r => r.id === id) ?? null;
+  }
 }
 
 function makeReq(user: any, query: any = {}) { return { user, query } as any; }
@@ -29,7 +31,7 @@ function makeRes() {
   } as any;
 }
 
-(async function run() {
+describe('Offerings Route Handlers', () => {
   const offers = [
     { id: 'o1', issuer_id: 's1', title: 'A', status: 'draft', amount: '100.00', created_at: new Date() },
     { id: 'o2', issuer_id: 's1', title: 'B', status: 'live', amount: '200.00', created_at: new Date() },
@@ -39,41 +41,45 @@ function makeRes() {
   const repo = new MockOfferingRepo(offers);
   const handlers = createOfferingHandlers(repo as any);
 
-  // success list
-  const req1 = makeReq({ id: 's1', role: 'startup' }, {});
-  const res1 = makeRes();
-  await handlers.listOfferings(req1, res1, (e:any)=>{ throw e; });
-  const out1 = res1._get();
-  assert(out1.statusCode === 200);
-  assert(Array.isArray(out1.jsonData.offerings) && out1.jsonData.offerings.length === 2);
+  it('lists holdings for authenticated startup', async () => {
+    const req = makeReq({ id: 's1', role: 'startup' }, {});
+    const res = makeRes();
+    await handlers.listOfferings(req, res, (e:any)=>{ throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(200);
+    expect(out.jsonData.offerings).toHaveLength(2);
+  });
 
-  // filter by status
-  const req2 = makeReq({ id: 's1', role: 'startup' }, { status: 'live' });
-  const res2 = makeRes();
-  await handlers.listOfferings(req2, res2, (e:any)=>{ throw e; });
-  const out2 = res2._get();
-  assert(out2.jsonData.offerings.length === 1 && out2.jsonData.offerings[0].id === 'o2');
+  it('filters list by status', async () => {
+    const req = makeReq({ id: 's1', role: 'startup' }, { status: 'live' });
+    const res = makeRes();
+    await handlers.listOfferings(req, res, (e:any)=>{ throw e; });
+    const out = res._get();
+    expect(out.jsonData.offerings).toHaveLength(1);
+    expect(out.jsonData.offerings[0].id).toBe('o2');
+  });
 
-  // pagination limit/offset
-  const req3 = makeReq({ id: 's1', role: 'startup' }, { limit: '1', offset: '1' });
-  const res3 = makeRes();
-  await handlers.listOfferings(req3, res3, (e:any)=>{ throw e; });
-  const out3 = res3._get();
-  assert(out3.jsonData.offerings.length === 1);
+  it('handles pagination limit/offset', async () => {
+    const req = makeReq({ id: 's1', role: 'startup' }, { limit: '1', offset: '1' });
+    const res = makeRes();
+    await handlers.listOfferings(req, res, (e:any)=>{ throw e; });
+    const out = res._get();
+    expect(out.jsonData.offerings).toHaveLength(1);
+  });
 
-  // unauthorized
-  const req4 = makeReq(null, {});
-  const res4 = makeRes();
-  await handlers.listOfferings(req4, res4, (e:any)=>{ throw e; });
-  const out4 = res4._get();
-  assert(out4.statusCode === 401);
+  it('returns 401 for unauthorized user', async () => {
+    const req = makeReq(null, {});
+    const res = makeRes();
+    await handlers.listOfferings(req, res, (e:any)=>{ throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(401);
+  });
 
-  // forbidden (non-startup)
-  const req5 = makeReq({ id: 's1', role: 'investor' }, {});
-  const res5 = makeRes();
-  await handlers.listOfferings(req5, res5, (e:any)=>{ throw e; });
-  const out5 = res5._get();
-  assert(out5.statusCode === 403);
-
-  console.log('offerings route tests passed');
-})();
+  it('returns 403 for user with wrong role', async () => {
+    const req = makeReq({ id: 's1', role: 'investor' }, {});
+    const res = makeRes();
+    await handlers.listOfferings(req, res, (e:any)=>{ throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(403);
+  });
+});

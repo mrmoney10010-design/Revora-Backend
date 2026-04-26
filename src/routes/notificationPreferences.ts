@@ -1,4 +1,5 @@
 import { RequestHandler, Router } from 'express';
+import { requireIdempotency } from '../middleware/configuredIdempotency';
 import { NotificationPreferencesRepository } from '../db/repositories/notificationPreferencesRepository';
 
 interface AuthenticatedRequest {
@@ -35,7 +36,7 @@ export const createNotificationPreferencesRouter = ({
     }
   });
 
-  router.patch('/api/users/me/notification-preferences', requireAuth, async (req, res) => {
+  router.patch('/api/users/me/notification-preferences', requireAuth, requireIdempotency, async (req, res) => {
     const userId = (req as any).user?.id;
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });

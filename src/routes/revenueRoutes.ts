@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { requireIdempotency } from '../middleware/configuredIdempotency';
 import { Pool } from 'pg';
 import { authMiddleware } from '../middleware/auth';
 import { OfferingRepository } from '../db/repositories/offeringRepository';
@@ -26,6 +27,7 @@ export const createRevenueRoutes = (db: Pool): Router => {
     router.post(
         '/offerings/:id/revenue',
         authMiddleware as any,
+        requireIdempotency,
         revenueHandler.submitReport
     );
 
@@ -35,6 +37,7 @@ export const createRevenueRoutes = (db: Pool): Router => {
     router.post(
         '/revenue-reports',
         authMiddleware as any,
+        requireIdempotency,
         revenueHandler.submitReport
     );
 

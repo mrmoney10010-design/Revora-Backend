@@ -62,11 +62,13 @@ function flushPromises(): Promise<void> {
 function dispatch(
   router: ReturnType<typeof createInvestmentsRouter>,
   req: Request,
-  res: Response
+  res: Response,
+  method: 'GET' | 'POST' = 'GET'
 ): void {
-  const outerNext = jest.fn(); // called only if every middleware passes through
-  const layer = router.stack[0];
-  layer.handle(req, res, outerNext);
+  (req as any).method = method;
+  (req as any).url = '/';
+  const outerNext = jest.fn();
+  router(req, res, outerNext);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import express, { Request, Response, NextFunction } from 'express';
+import { requireIdempotency } from '../middleware/configuredIdempotency';
 
 export interface Notification {
   id: string;
@@ -70,7 +71,7 @@ export default function createNotificationsRouter(opts: {
   router.get('/api/notifications', opts.verifyJWT, handlers.getNotifications);
 
   // PATCH single or bulk
-  router.patch('/api/notifications/:id/read', opts.verifyJWT, handlers.markRead);
+  router.patch('/api/notifications/:id/read', opts.verifyJWT, requireIdempotency, handlers.markRead);
 
   return router;
 }

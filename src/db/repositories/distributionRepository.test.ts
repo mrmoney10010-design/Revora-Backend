@@ -258,7 +258,15 @@ describe('DistributionRepository', () => {
       const result = await repository.listByOffering(offeringId);
 
       expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringContaining('SELECT * FROM distribution_runs'),
+        expect.stringContaining('SELECT *'),
+        [offeringId]
+      );
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('FROM distribution_runs'),
+        [offeringId]
+      );
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('WHERE offering_id = $1'),
         [offeringId]
       );
       expect(result).toHaveLength(2);
@@ -323,7 +331,15 @@ describe('DistributionRepository', () => {
       const result = await repository.listPayoutsByInvestor(investorId);
 
       expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringContaining('SELECT * FROM payouts'),
+        expect.stringContaining('SELECT *'),
+        [investorId]
+      );
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('FROM payouts'),
+        [investorId]
+      );
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('WHERE investor_id = $1'),
         [investorId]
       );
       expect(result).toHaveLength(2);

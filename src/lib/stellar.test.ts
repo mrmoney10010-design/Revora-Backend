@@ -341,8 +341,12 @@ describe('HorizonClient', () => {
       abortError.name = 'AbortError';
 
       mockFetch.mockImplementation(
-        () =>
+        (_url, options) =>
           new Promise((_resolve, reject) => {
+            if (options?.signal?.aborted) {
+              return reject(abortError);
+            }
+            options?.signal?.addEventListener('abort', () => reject(abortError));
             setTimeout(() => reject(abortError), 10000);
           })
       );

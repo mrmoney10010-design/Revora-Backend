@@ -73,9 +73,8 @@ export function issueToken(options: TokenOptions): string {
   const algorithm = getJwtAlgorithm();
 
   const payload: JwtPayload = {
-    sub: options.subject,
     ...options.additionalPayload,
-  };
+  } as unknown as JwtPayload;
 
   const signOptions: jwt.SignOptions = {
     algorithm,
@@ -126,9 +125,19 @@ export function verifyToken(token: string): JwtPayload {
   const secret = getJwtSecret();
   const algorithm = getJwtAlgorithm();
 
-  const payload = jwt.verify(token, secret, {
-    algorithms: [algorithm],
-  }) as JwtPayload;
+  try {
+    const payload = jwt.verify(token, secret, {
+      algorithms: [algorithm],
+    }) as JwtPayload;
 
-  return payload;
+    return payload;
+  } catch (err) {
+    if (err instanceof jwt.TokenExpiredError) {
+      throw new Error('Token has expired');
+    }
+    if (err instanceof jwt.JsonWebTokenError) {
+      throw new Error('Invalid token');
+    }
+    throw err;
+  }
 }

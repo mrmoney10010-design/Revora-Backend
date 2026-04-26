@@ -678,8 +678,34 @@ describe('OfferingConflictResolver', () => {
                 rows: [{ version: 6, updated_at: new Date(), sync_hash: input1.syncHash }],
             });
 
+            mockClient.query
+                .mockResolvedValueOnce({ rows: [] })
+                .mockResolvedValueOnce({
+                    rows: [{
+                        id: input2.offeringId,
+                        version: 6,
+                        sync_hash: input1.syncHash,
+                        status: 'active',
+                        total_raised: '5000.00',
+                        contract_address: 'CONTRACT_ABC',
+                        updated_at: input1.syncedAt,
+                    }],
+                })
+                .mockResolvedValueOnce({
+                    rows: [{
+                        id: input2.offeringId,
+                        version: 7,
+                        sync_hash: input2.syncHash,
+                        status: 'closed',
+                        total_raised: '5000.00',
+                        contract_address: 'CONTRACT_ABC',
+                        updated_at: input2.syncedAt,
+                    }],
+                })
+                .mockResolvedValueOnce({ rows: [] });
+
             const result2 = await resolver.syncWithConflictResolution(input2);
-            expect(result2.finalVersion).toBe(6);
+            expect(result2.finalVersion).toBe(7);
         });
 
         it('should maintain data integrity under high concurrency', async () => {

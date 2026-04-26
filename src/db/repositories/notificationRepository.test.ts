@@ -1,4 +1,3 @@
-import assert from 'assert';
 import { NotificationRepository } from './notificationRepository';
 
 class MockPool {
@@ -8,7 +7,7 @@ class MockPool {
   }
 }
 
-(async function run() {
+describe('NotificationRepository', () => {
   const sampleNotification = {
     id: 'n1',
     user_id: 'u1',
@@ -19,29 +18,30 @@ class MockPool {
     created_at: new Date(),
   };
 
-  // Test create
-  const createRepo = new NotificationRepository(new MockPool([sampleNotification]) as any);
-  const created = await createRepo.create({
-    user_id: 'u1',
-    type: 'info',
-    title: 'Test Notification',
-    body: 'This is a test notification',
+  it('creates a notification', async () => {
+    const createRepo = new NotificationRepository(new MockPool([sampleNotification]) as any);
+    const created = await createRepo.create({
+      user_id: 'u1',
+      type: 'info',
+      title: 'Test Notification',
+      body: 'This is a test notification',
+    });
+    expect(created.title).toBe('Test Notification');
+    expect(created.user_id).toBe('u1');
   });
-  assert(created.title === 'Test Notification');
-  assert(created.user_id === 'u1');
 
-  // Test listByUser
-  const listRepo = new NotificationRepository(new MockPool([sampleNotification, { ...sampleNotification, id: 'n2' }]) as any);
-  const notifications = await listRepo.listByUser('u1');
-  assert(notifications.length === 2);
-  assert(notifications[0].user_id === 'u1');
+  it('lists notifications by user', async () => {
+    const listRepo = new NotificationRepository(new MockPool([sampleNotification, { ...sampleNotification, id: 'n2' }]) as any);
+    const notifications = await listRepo.listByUser('u1');
+    expect(notifications).toHaveLength(2);
+    expect(notifications[0].user_id).toBe('u1');
+  });
 
-  // Test markRead
-  const readNotification = { ...sampleNotification, read_at: new Date() };
-  const markReadRepo = new NotificationRepository(new MockPool([readNotification]) as any);
-  const marked = await markReadRepo.markRead('n1');
-  assert(marked.read_at !== null);
-  assert(marked.id === 'n1');
-
-  console.log('notificationRepository tests passed');
-})();
+  it('marks a notification as read', async () => {
+    const readNotification = { ...sampleNotification, read_at: new Date() };
+    const markReadRepo = new NotificationRepository(new MockPool([readNotification]) as any);
+    const marked = await markReadRepo.markRead('n1');
+    expect(marked.read_at).not.toBeNull();
+    expect(marked.id).toBe('n1');
+  });
+});

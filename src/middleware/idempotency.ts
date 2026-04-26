@@ -35,31 +35,30 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
   constructor(private readonly repository: IdempotencyRepository) {}
 
   async checkAndReserve(key: string, requestHash: string): Promise<IdempotencyCheckResult> {
-    const existing = await this.repository.find(key);
+    const result = await this.repository.checkAndReserve(key, requestHash);
 
-    if (!existing) {
-      const reserved = await this.repository.reserve(key, requestHash);
-      return reserved ? { state: 'new' } : { state: 'inflight' };
-    }
-
-    // Check for request mismatch
-    if (existing.request_hash && existing.request_hash !== requestHash) {
+    if (result.state === 'mismatch') {
       return { state: 'mismatch' };
     }
 
-    if (existing.status === 'started') {
+    if (result.state === 'inflight') {
       return { state: 'inflight' };
     }
 
-    return {
-      state: 'cached',
-      record: {
-        status: existing.response_status!,
-        body: existing.response_body!,
-        contentType: existing.response_content_type,
-        createdAt: existing.created_at,
-      },
-    };
+    if (result.state === 'cached') {
+      return {
+        state: 'cached',
+        record: {
+          status: result.record!.response_status!,
+          body: result.record!.response_body!,
+          contentType: result.record!.response_content_type,
+          createdAt: result.record!.created_at,
+        },
+      };
+    }
+
+    // state === 'new'
+    return { state: 'new' };
   }
 
   async save(key: string, record: IdempotencyRecord): Promise<void> {
@@ -142,14 +141,18 @@ export interface IdempotencyMiddlewareOptions {
 const DEFAULT_METHODS = ['POST', 'PATCH'];
 const DEFAULT_HEADER = 'idempotency-key';
 
-function logIdempotency(data: Record<string, unknown>) {
-  console.log(
-    JSON.stringify({
-      type: 'idempotency',
-      timestamp: new Date().toISOString(),
-      ...data,
-    })
-  );
+function logIdempotency(req: Request, data: Record<string, unknown>) {
+  const logEntry: Record<string, unknown> = {
+    type: 'idempotency',
+    timestamp: new Date().toISOString(),
+    requestId: (req as any).requestId,
+    userId: (req as any).user?.id,
+    clientIp: req.ip || req.socket?.remoteAddress,
+    path: req.path,
+    method: req.method,
+    ...data,
+  };
+  console.log(JSON.stringify(logEntry));
 }
 
 function toHeaderString(value: unknown): string | undefined {
@@ -229,27 +232,27 @@ export function createIdempotencyMiddleware(
       const checkResult = await store.checkAndReserve(key, requestHash);
 
       if (checkResult.state === 'mismatch') {
-        logIdempotency({ key, state: 'mismatch', path: req.path, method: req.method });
+        logIdempotency(req, { key, state: 'mismatch' });
         return next(
           Errors.badRequest('Idempotency key mismatch: this key was previously used for a different request.')
         );
       }
 
       if (checkResult.state === 'cached') {
-        logIdempotency({ key, state: 'cached', path: req.path, method: req.method });
+        logIdempotency(req, { key, state: 'cached' });
         replayResponse(res, checkResult.record);
         return;
       }
 
       if (checkResult.state === 'inflight') {
-        logIdempotency({ key, state: 'inflight', path: req.path, method: req.method });
+        logIdempotency(req, { key, state: 'inflight' });
         res.setHeader('Idempotency-Status', 'inflight');
         return next(
           Errors.conflict('A request with this idempotency key is already in progress.')
         );
       }
 
-      logIdempotency({ key, state: 'new', path: req.path, method: req.method, hash: requestHash });
+      logIdempotency(req, { key, state: 'new', hash: requestHash });
 
       // Hijack response methods to capture the body
       let responseBody = '';
@@ -279,14 +282,14 @@ export function createIdempotencyMiddleware(
             createdAt: new Date(),
           };
           await store.save(key, record).catch((err) => {
-             console.error('Failed to save idempotency record:', err);
+             console.error('Failed to save idempotency record:', err, { key, status: res.statusCode });
           });
-          logIdempotency({ key, state: 'saved', status: res.statusCode });
+          logIdempotency(req, { key, state: 'saved', status: res.statusCode });
         } else {
           await store.release(key).catch((err) => {
-             console.error('Failed to release idempotency key:', err);
+             console.error('Failed to release idempotency key:', err, { key });
           });
-          logIdempotency({ key, state: 'released', status: res.statusCode });
+          logIdempotency(req, { key, state: 'released', status: res.statusCode });
         }
       };
 
@@ -295,7 +298,12 @@ export function createIdempotencyMiddleware(
 
       next();
     } catch (err) {
-      console.error('Idempotency middleware error:', err);
+      console.error('Idempotency middleware error:', err, {
+        key: req.get(headerName),
+        path: req.path,
+        method: req.method,
+        requestId: (req as any).requestId,
+      });
       // On internal error, we allow the request to proceed without idempotency
       // to avoid blocking clients due to infra issues.
       next();

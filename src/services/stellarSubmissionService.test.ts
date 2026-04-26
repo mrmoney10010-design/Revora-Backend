@@ -1,3 +1,4 @@
+process.env.STELLAR_SERVER_SECRET = 'S' + 'A'.repeat(55); // 56 characters
 import * as StellarSdk from 'stellar-sdk';
 import { StellarSubmissionService } from './stellarSubmissionService';
 import { env } from '../config/env';

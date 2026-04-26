@@ -1,4 +1,5 @@
 import express, { Request, Response, NextFunction } from 'express';
+import { requireIdempotency } from '../middleware/configuredIdempotency';
 
 export interface OfferingRepo {
   getById: (id: string) => Promise<{ id: string; issuer_id: string } | null>;
@@ -49,7 +50,7 @@ export default function createDistributionsRouter(opts: { distributionEngine: an
   const router = express.Router();
   const handlers = createDistributionHandlers(opts.distributionEngine, opts.offeringRepo);
 
-  router.post('/api/offerings/:id/distribute', opts.verifyJWT, handlers.triggerDistribution);
+  router.post('/api/offerings/:id/distribute', opts.verifyJWT, requireIdempotency, handlers.triggerDistribution);
 
   return router;
 }

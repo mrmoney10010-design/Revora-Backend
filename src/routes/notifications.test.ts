@@ -1,7 +1,5 @@
-import assert from 'assert';
 import { createNotificationHandlers } from './notifications';
 
-// Mock notification repo
 class MockNotificationRepo {
   notifications: any[] = [];
   marked: string[] = [];
@@ -42,47 +40,54 @@ function makeRes() {
   } as any;
 }
 
-(async function run() {
+describe('Notifications Route Handlers', () => {
   const rows = [
     { id: 'n1', user_id: 'u1', message: 'm1', read: false, type: 'info', created_at: new Date() },
     { id: 'n2', user_id: 'u1', message: 'm2', read: false, type: 'alert', created_at: new Date() },
     { id: 'n3', user_id: 'u2', message: 'm3', read: false, type: 'info', created_at: new Date() },
   ];
 
-  const repo = new MockNotificationRepo(rows);
-  const handlers = createNotificationHandlers(repo as any);
+  let repo: MockNotificationRepo;
+  let handlers: any;
 
-  // GET notifications
-  const req1 = makeReq({ id: 'u1' });
-  const res1 = makeRes();
-  await handlers.getNotifications(req1, res1, (e: any) => { throw e; });
-  const out1 = res1._get();
-  assert(out1.statusCode === 200);
-  assert(out1.jsonData.notifications.length === 2, 'expected 2 notifications for u1');
+  beforeEach(() => {
+    repo = new MockNotificationRepo(JSON.parse(JSON.stringify(rows)));
+    handlers = createNotificationHandlers(repo as any);
+  });
 
-  // PATCH single
-  const req2 = makeReq({ id: 'u1' }, { id: 'n1' }, {});
-  const res2 = makeRes();
-  await handlers.markRead(req2, res2, (e: any) => { throw e; });
-  const out2 = res2._get();
-  assert(out2.statusCode === 200);
-  assert(out2.jsonData.marked === 1);
-  assert(repo.notifications.find((n) => n.id === 'n1')!.read === true);
+  it('lists notifications for user', async () => {
+    const req = makeReq({ id: 'u1' });
+    const res = makeRes();
+    await handlers.getNotifications(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(200);
+    expect(out.jsonData.notifications).toHaveLength(2);
+  });
 
-  // PATCH bulk
-  const req3 = makeReq({ id: 'u1' }, {}, { ids: ['n2'] });
-  const res3 = makeRes();
-  await handlers.markRead(req3, res3, (e: any) => { throw e; });
-  const out3 = res3._get();
-  assert(out3.statusCode === 200);
-  assert(out3.jsonData.marked === 1);
+  it('marks a single notification as read', async () => {
+    const req = makeReq({ id: 'u1' }, { id: 'n1' }, {});
+    const res = makeRes();
+    await handlers.markRead(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(200);
+    expect(out.jsonData.marked).toBe(1);
+    expect(repo.notifications.find((n) => n.id === 'n1')!.read).toBe(true);
+  });
 
-  // Unauthorized
-  const req4 = makeReq(null);
-  const res4 = makeRes();
-  await handlers.getNotifications(req4, res4, (e: any) => { throw e; });
-  const out4 = res4._get();
-  assert(out4.statusCode === 401);
+  it('marks notifications in bulk as read', async () => {
+    const req = makeReq({ id: 'u1' }, {}, { ids: ['n2'] });
+    const res = makeRes();
+    await handlers.markRead(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(200);
+    expect(out.jsonData.marked).toBe(1);
+  });
 
-  console.log('notifications route tests passed');
-})();
+  it('returns 401 if unauthenticated', async () => {
+    const req = makeReq(null);
+    const res = makeRes();
+    await handlers.getNotifications(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(401);
+  });
+});

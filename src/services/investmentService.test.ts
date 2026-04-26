@@ -122,7 +122,7 @@ describe('InvestmentService', () => {
     it('throws VALIDATION_ERROR when amount is invalid', async () => {
       // Arrange
       const offeringRow = makeOfferingRow({ status: 'active' });
-      mockPool.query.mockResolvedValueOnce(mockQueryResult([offeringRow]));
+      mockPool.query.mockResolvedValue(mockQueryResult([offeringRow]));
 
       // Act & Assert
       await expect(service.createInvestment({ ...baseInput, amount: '-100' })).rejects.toThrow('Invalid amount');
