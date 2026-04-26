@@ -10,8 +10,11 @@ import { classifyStellarRPCFailure } from '../lib/stellarRpcFailure';
  * 2. Proration of revenue based on balances
  * 3. Rounding adjustment to ensure total payout equals revenue amount
  * 4. Persistence of distribution runs and individual payouts with a retry strategy
- * 5. Idempotency and at-least-once safety via resumption logic
+ * 5. Batch processing for large payout sets with partial failure handling
  */
+
+import { Logger, globalLogger } from '../lib/logger';
+import { classifyStellarRPCFailure, StellarRPCFailureClass } from '../lib/stellarRpcFailure';
 
 export interface BalanceRow {
   investor_id: string;
@@ -23,16 +26,31 @@ export interface DistributionResult {
   payouts: Array<{ investor_id: string; amount: string }>;
 }
 
+/** Enhanced result type with batch processing details */
+export interface DistributionBatchResult {
+  distributionRun: any;
+  successfulPayouts: Array<{ investor_id: string; amount: string }>;
+  failedPayouts: Array<{ investor_id: string; amount: string; error: string; errorClass?: string }>;
+  totalPayouts: number;
+}
+
 export interface DistributionEngineOptions {
   maxRetries?: number;
   initialDelayMs?: number;
   backoffFactor?: number;
+  /** Log retry attempts to console/logger */
+  logRetries?: boolean;
+  /** Max payouts per batch to prevent overwhelming the database (default: 50) */
+  batchSize?: number;
 }
 
 export class DistributionEngine {
   private readonly maxRetries: number;
   private readonly initialDelayMs: number;
   private readonly backoffFactor: number;
+  private readonly logRetries: boolean;
+  private readonly batchSize: number;
+  private readonly logger: Logger;
 
   constructor(
     private offeringRepo: any,
@@ -43,22 +61,54 @@ export class DistributionEngine {
     this.maxRetries = options.maxRetries ?? 3;
     this.initialDelayMs = options.initialDelayMs ?? 500;
     this.backoffFactor = options.backoffFactor ?? 2;
+    this.logRetries = options.logRetries ?? false;
+    this.batchSize = options.batchSize ?? 50;
+    this.logger = globalLogger;
   }
 
   /**
    * @notice Distribute revenueAmount across investors for an offering and period.
-   * @dev Implementation follows RC26Q2-B03 requirements:
-   * - Idempotent: checks for existing runs with same parameters.
-   * - Resumable: recovers from partial payout persistence failures.
-   * - Secure: uses structured logging and standardized errors.
+   * @dev Security Assumptions:
+   * - revenueAmount must be strictly positive.
+   * - offeringId must be valid and exist (checked by repo).
+   * - totalBalance must be > 0.
+   * - Payouts are persisted with a retry strategy to handle transient failures.
+   * - Batch processing prevents overwhelming the database with large payout sets.
+   *
+   * @param offeringId The unique identifier of the offering
+   * @param period The timeframe for which the distribution is being made
+   * @param revenueAmount The total amount of revenue to be distributed
+   * @returns The created distribution run and the list of payouts
    */
   async distribute(
     offeringId: string,
     period: { id: string; start: Date; end: Date },
     revenueAmount: number
   ): Promise<DistributionResult> {
-    const logger = globalLogger.child({ offeringId, periodId: period.id, revenueAmount });
-    
+    const result = await this.distributeWithBatch(offeringId, period, revenueAmount);
+    // Backward compatibility: return original shape
+    return {
+      distributionRun: result.distributionRun,
+      payouts: result.successfulPayouts,
+    };
+  }
+
+  /**
+   * @notice Distribute revenueAmount with batch processing and partial failure tracking.
+   * @dev This is the enhanced version that returns detailed batch results.
+   *
+   * @param offeringId The unique identifier of the offering
+   * @param period The timeframe for which the distribution is being made
+   * @param revenueAmount The total amount of revenue to be distributed
+   * @returns Batch result with successful and failed payouts
+   */
+  async distributeWithBatch(
+    offeringId: string,
+    period: { start: Date; end: Date },
+    revenueAmount: number
+  ): Promise<DistributionBatchResult> {
+    const startTime = Date.now();
+
     // 1. Validation
     if (!offeringId) throw Errors.badRequest('offeringId is required');
     if (revenueAmount <= 0) throw Errors.badRequest('revenueAmount must be > 0');
@@ -143,43 +193,83 @@ export class DistributionEngine {
       await this.distributionRepo.updateRunStatus(run.id, 'processing');
     }
 
-    // 6. Persist payouts with resumption logic (at-least-once safety)
-    const existingPayouts = await this.distributionRepo.getPayoutsForRun(run.id);
-    const existingInvestorIds = new Set(existingPayouts.map((p: any) => p.investor_id));
+    this.logger.info('Distribution batch started', {
+      offeringId,
+      runId: run.id,
+      period,
+      revenueAmount,
+      investorCount: balances.length,
+      batchSize: this.batchSize,
+    });
 
-    const finalPayouts: Array<{ investor_id: string; amount: string }> = [];
+    // 6. Process payouts in batches with partial failure tracking
+    const successfulPayouts: Array<{ investor_id: string; amount: string }> = [];
+    const failedPayouts: Array<{ investor_id: string; amount: string; error: string; errorClass?: string }> = [];
 
-    for (const r of rounded) {
-      const payoutAmtStr = r.amount.toFixed(2);
-      
-      if (existingInvestorIds.has(r.investor_id)) {
-        logger.debug('Payout already exists for investor, skipping', { investorId: r.investor_id });
-        finalPayouts.push({ investor_id: r.investor_id, amount: payoutAmtStr });
-        continue;
-      }
+    for (let batchStart = 0; batchStart < rounded.length; batchStart += this.batchSize) {
+      const batch = rounded.slice(batchStart, batchStart + this.batchSize);
+      const batchNumber = Math.floor(batchStart / this.batchSize) + 1;
 
       try {
-        await this.withRetry(() =>
-          this.distributionRepo.createPayout({
-            distribution_id: run.id,
-            investor_id: r.investor_id,
-            amount: payoutAmtStr,
-            status: 'pending',
-          })
-        );
-        finalPayouts.push({ investor_id: r.investor_id, amount: payoutAmtStr });
+        for (const r of batch) {
+          const amtStr = r.amount.toFixed(2);
+          try {
+            await this.withRetry(() =>
+              this.distributionRepo.createPayout({
+                distribution_run_id: run.id,
+                investor_id: r.investor_id,
+                amount: amtStr,
+                status: 'pending',
+              })
+            );
+            successfulPayouts.push({ investor_id: r.investor_id, amount: amtStr });
+          } catch (err) {
+            const errorClass = classifyStellarRPCFailure(err);
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            
+            this.logger.error('Payout creation failed', {
+              offeringId,
+              runId: run.id,
+              investorId: r.investor_id,
+              errorClass,
+              batchNumber,
+            });
+
+            failedPayouts.push({
+              investor_id: r.investor_id,
+              amount: amtStr,
+              error: errorMessage,
+              errorClass,
+            });
+          }
+        }
       } catch (err) {
-        logger.error('Failed to create payout', { investorId: r.investor_id, error: err });
-        await this.distributionRepo.updateRunStatus(run.id, 'failed');
-        throw Errors.internal(`Failed to persist payout for investor ${r.investor_id}`);
+        this.logger.error('Payout batch failed', {
+          offeringId,
+          runId: run.id,
+          batchNumber,
+          errorClass: classifyStellarRPCFailure(err),
+          investorCount: batch.length,
+        });
       }
     }
 
-    // 7. Finalize run
-    await this.distributionRepo.updateRunStatus(run.id, 'completed');
-    logger.info('Distribution run completed successfully', { runId: run.id, payoutCount: finalPayouts.length });
+    const duration = Date.now() - startTime;
+    this.logger.info('Distribution batch completed', {
+      offeringId,
+      runId: run.id,
+      successfulPayouts: successfulPayouts.length,
+      failedPayouts: failedPayouts.length,
+      totalPayouts: rounded.length,
+      duration,
+    });
 
-    return { distributionRun: { ...run, status: 'completed' }, payouts: finalPayouts };
+    return {
+      distributionRun: run,
+      successfulPayouts,
+      failedPayouts,
+      totalPayouts: rounded.length,
+    };
   }
 
   /**
@@ -210,7 +300,13 @@ export class DistributionEngine {
         lastError = err;
         if (attempt < this.maxRetries) {
           const delay = this.initialDelayMs * Math.pow(this.backoffFactor, attempt - 1);
-          await new Promise((resolve) => setTimeout(resolve, delay));
+          if (this.logRetries) {
+            this.logger.warn(`[DistributionEngine] Retry attempt ${attempt} failed, retrying in ${delay}ms...`);
+          }
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, delay);
+            if (timer.unref) timer.unref();
+          });
         }
       }
     }
