@@ -1,4 +1,4 @@
-import { Pool, PoolClient } from 'pg';
+import { Pool, PoolClient, QueryResult } from 'pg';
 import {
   withTransaction,
   transactional,
@@ -7,27 +7,38 @@ import {
 
 describe('Repository Transaction Boundaries', () => {
   let mockPool: jest.Mocked<Pool>;
-  let mockClient: jest.Mocked<PoolClient>;
+  let mockClient: {
+    query: jest.Mock<Promise<QueryResult<any>>, any[]>;
+    release: jest.Mock<void, []>;
+  };
 
   beforeEach(() => {
-    // Create mock client
+    // Create mock client with explicit types to avoid 'never' inference
     mockClient = {
-      query: jest.fn(),
-      release: jest.fn(),
-    } as unknown as jest.Mocked<PoolClient>;
+      query: jest.fn<Promise<QueryResult<any>>, any[]>(),
+      release: jest.fn<void, []>(),
+    };
 
     // Create mock pool
     mockPool = {
-      connect: jest.fn().mockResolvedValue(mockClient),
-      query: jest.fn(),
+      connect: jest.fn<Promise<any>, []>().mockResolvedValue(mockClient),
+      query: jest.fn<Promise<any>, any[]>(),
     } as unknown as jest.Mocked<Pool>;
 
     jest.clearAllMocks();
   });
 
+  const createMockQueryResult = (rows: any[] = []): QueryResult<any> => ({
+    rows,
+    command: '',
+    oid: 0,
+    fields: [],
+    rowCount: rows.length,
+  });
+
   describe('Successful Transaction Commit', () => {
     it('should commit transaction on successful execution', async () => {
-      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
+      mockClient.query.mockResolvedValue(createMockQueryResult());
 
       const result = await withTransaction(mockPool, async (client) => {
         await client.query('INSERT INTO users (email) VALUES ($1)', ['test@example.com']);
@@ -43,7 +54,7 @@ describe('Repository Transaction Boundaries', () => {
     });
 
     it('should execute multiple operations atomically', async () => {
-      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
+      mockClient.query.mockResolvedValue(createMockQueryResult());
 
       await withTransaction(mockPool, async (client) => {
         await client.query('INSERT INTO users (email) VALUES ($1)', ['user1@example.com']);
@@ -61,7 +72,7 @@ describe('Repository Transaction Boundaries', () => {
         rows: [{ id: '123', email: 'test@example.com' }], 
         command: 'INSERT', 
         oid: 0, 
-        fields: [], 
+        fields: [] as any[], 
         rowCount: 1 
       });
 
@@ -109,10 +120,10 @@ describe('Repository Transaction Boundaries', () => {
   describe('Transaction Rollback on Error', () => {
     it('should rollback transaction on error', async () => {
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // First insert
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
+        .mockResolvedValueOnce(createMockQueryResult()) // First insert
         .mockRejectedValueOnce(new Error('Unique constraint violation')) // Second insert fails
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }); // ROLLBACK
+        .mockResolvedValueOnce(createMockQueryResult()); // ROLLBACK
 
       await expect(
         withTransaction(mockPool, async (client) => {
@@ -127,11 +138,11 @@ describe('Repository Transaction Boundaries', () => {
 
     it('should prevent partial writes on failure', async () => {
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // First insert succeeds
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // Second insert succeeds
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
+        .mockResolvedValueOnce(createMockQueryResult()) // First insert succeeds
+        .mockResolvedValueOnce(createMockQueryResult()) // Second insert succeeds
         .mockRejectedValueOnce(new Error('Foreign key violation')) // Third insert fails
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }); // ROLLBACK
+        .mockResolvedValueOnce(createMockQueryResult()); // ROLLBACK
 
       await expect(
         withTransaction(mockPool, async (client) => {
@@ -150,9 +161,9 @@ describe('Repository Transaction Boundaries', () => {
 
     it('should include rollback status in error', async () => {
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
         .mockRejectedValueOnce(new Error('Query failed'))
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }); // ROLLBACK
+        .mockResolvedValueOnce(createMockQueryResult()); // ROLLBACK
 
       try {
         await withTransaction(mockPool, async (client) => {
@@ -167,11 +178,11 @@ describe('Repository Transaction Boundaries', () => {
 
     it('should handle rollback failure gracefully', async () => {
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
         .mockRejectedValueOnce(new Error('Query failed'))
         .mockRejectedValueOnce(new Error('Rollback failed')); // ROLLBACK fails
 
-      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+      const stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation();
 
       try {
         await withTransaction(mockPool, async (client) => {
@@ -186,13 +197,13 @@ describe('Repository Transaction Boundaries', () => {
         );
       }
 
-      consoleErrorSpy.mockRestore();
+      stderrSpy.mockRestore();
     });
   });
 
   describe('Connection Pool Management', () => {
     it('should release connection after successful commit', async () => {
-      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
+      mockClient.query.mockResolvedValue(createMockQueryResult());
 
       await withTransaction(mockPool, async (client) => {
         await client.query('SELECT 1');
@@ -203,9 +214,9 @@ describe('Repository Transaction Boundaries', () => {
 
     it('should release connection after rollback', async () => {
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
         .mockRejectedValueOnce(new Error('Query failed'))
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }); // ROLLBACK
+        .mockResolvedValueOnce(createMockQueryResult()); // ROLLBACK
 
       await expect(
         withTransaction(mockPool, async (client) => {
@@ -218,7 +229,7 @@ describe('Repository Transaction Boundaries', () => {
 
     it('should release connection even if rollback fails', async () => {
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
         .mockRejectedValueOnce(new Error('Query failed'))
         .mockRejectedValueOnce(new Error('Rollback failed'));
 
@@ -235,8 +246,8 @@ describe('Repository Transaction Boundaries', () => {
 
     it('should not leak connections on callback exception', async () => {
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }); // ROLLBACK
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
+        .mockResolvedValueOnce(createMockQueryResult()); // ROLLBACK
 
       await expect(
         withTransaction(mockPool, async () => {
@@ -251,12 +262,12 @@ describe('Repository Transaction Boundaries', () => {
   describe('Nested Transaction Behavior', () => {
     it('should create independent transactions for nested calls', async () => {
       const mockClient2 = {
-        query: jest.fn().mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }),
-        release: jest.fn(),
-      } as unknown as jest.Mocked<PoolClient>;
+        query: jest.fn<Promise<QueryResult<any>>, any[]>().mockResolvedValue(createMockQueryResult()),
+        release: jest.fn<void, []>(),
+      };
 
-      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
-      mockPool.connect
+      mockClient.query.mockResolvedValue(createMockQueryResult());
+      (mockPool.connect as jest.Mock)
         .mockResolvedValueOnce(mockClient)
         .mockResolvedValueOnce(mockClient2);
 
@@ -280,15 +291,15 @@ describe('Repository Transaction Boundaries', () => {
 
     it('should rollback nested transaction independently', async () => {
       const mockClient2 = {
-        query: jest.fn()
-          .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
+        query: jest.fn<Promise<QueryResult<any>>, any[]>()
+          .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
           .mockRejectedValueOnce(new Error('Nested query failed'))
-          .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }), // ROLLBACK
-        release: jest.fn(),
-      } as unknown as jest.Mocked<PoolClient>;
+          .mockResolvedValueOnce(createMockQueryResult()), // ROLLBACK
+        release: jest.fn<void, []>(),
+      };
 
-      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
-      mockPool.connect
+      mockClient.query.mockResolvedValue(createMockQueryResult());
+      (mockPool.connect as jest.Mock)
         .mockResolvedValueOnce(mockClient)
         .mockResolvedValueOnce(mockClient2);
 
@@ -341,7 +352,7 @@ describe('Repository Transaction Boundaries', () => {
 
   describe('Transaction Options', () => {
     it('should support custom isolation level', async () => {
-      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
+      mockClient.query.mockResolvedValue(createMockQueryResult());
 
       await withTransaction(
         mockPool,
@@ -355,7 +366,7 @@ describe('Repository Transaction Boundaries', () => {
     });
 
     it('should support read-only transactions', async () => {
-      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
+      mockClient.query.mockResolvedValue(createMockQueryResult());
 
       await withTransaction(
         mockPool,
@@ -369,7 +380,7 @@ describe('Repository Transaction Boundaries', () => {
     });
 
     it('should support combined isolation level and read-only', async () => {
-      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
+      mockClient.query.mockResolvedValue(createMockQueryResult());
 
       await withTransaction(
         mockPool,
@@ -383,7 +394,7 @@ describe('Repository Transaction Boundaries', () => {
     });
 
     it('should use default READ COMMITTED isolation level', async () => {
-      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
+      mockClient.query.mockResolvedValue(createMockQueryResult());
 
       await withTransaction(mockPool, async (client) => {
         await client.query('SELECT 1');
@@ -399,9 +410,9 @@ describe('Repository Transaction Boundaries', () => {
       (serializationError as any).code = '40001';
 
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
         .mockRejectedValueOnce(serializationError)
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }); // ROLLBACK
+        .mockResolvedValueOnce(createMockQueryResult()); // ROLLBACK
 
       await expect(
         withTransaction(mockPool, async (client) => {
@@ -417,9 +428,9 @@ describe('Repository Transaction Boundaries', () => {
       (deadlockError as any).code = '40P01';
 
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
         .mockRejectedValueOnce(deadlockError)
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }); // ROLLBACK
+        .mockResolvedValueOnce(createMockQueryResult()); // ROLLBACK
 
       await expect(
         withTransaction(mockPool, async (client) => {
@@ -437,9 +448,9 @@ describe('Repository Transaction Boundaries', () => {
       const error = new Error('Connection failed: postgresql://user:password@localhost:5432/db');
       
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
         .mockRejectedValueOnce(error)
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }); // ROLLBACK
+        .mockResolvedValueOnce(createMockQueryResult()); // ROLLBACK
 
       try {
         await withTransaction(mockPool, async (client) => {
@@ -457,9 +468,9 @@ describe('Repository Transaction Boundaries', () => {
       const error = new Error('Auth failed: password=secret123');
       
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
         .mockRejectedValueOnce(error)
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }); // ROLLBACK
+        .mockResolvedValueOnce(createMockQueryResult()); // ROLLBACK
 
       try {
         await withTransaction(mockPool, async (client) => {
@@ -477,9 +488,9 @@ describe('Repository Transaction Boundaries', () => {
       const error = new Error('API error: token abc123def456ghi789jkl012mno345pqr678');
       
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
         .mockRejectedValueOnce(error)
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }); // ROLLBACK
+        .mockResolvedValueOnce(createMockQueryResult()); // ROLLBACK
 
       try {
         await withTransaction(mockPool, async (client) => {
@@ -500,13 +511,13 @@ describe('Repository Transaction Boundaries', () => {
         rows: [{ id: '1' }], 
         command: 'INSERT', 
         oid: 0, 
-        fields: [], 
+        fields: [] as any[], 
         rowCount: 1 
       });
 
       const [result1, result2] = await transactional(mockPool, [
-        (client) => client.query('INSERT INTO users (email) VALUES ($1) RETURNING id', ['user1@example.com']),
-        (client) => client.query('INSERT INTO users (email) VALUES ($1) RETURNING id', ['user2@example.com']),
+        (client) => (client as any).query('INSERT INTO users (email) VALUES ($1) RETURNING id', ['user1@example.com']),
+        (client) => (client as any).query('INSERT INTO users (email) VALUES ($1) RETURNING id', ['user2@example.com']),
       ]);
 
       expect(result1).toHaveProperty('rows');
@@ -517,15 +528,15 @@ describe('Repository Transaction Boundaries', () => {
 
     it('should rollback all operations if any fails', async () => {
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
-        .mockResolvedValueOnce({ rows: [{ id: '1' }], command: 'INSERT', oid: 0, fields: [], rowCount: 1 }) // First insert
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: '1' }], command: 'INSERT', oid: 0, fields: [] as any[], rowCount: 1 }) // First insert
         .mockRejectedValueOnce(new Error('Second insert failed'))
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }); // ROLLBACK
+        .mockResolvedValueOnce(createMockQueryResult()); // ROLLBACK
 
       await expect(
         transactional(mockPool, [
-          (client) => client.query('INSERT INTO users (email) VALUES ($1)', ['user1@example.com']),
-          (client) => client.query('INSERT INTO users (email) VALUES ($1)', ['user1@example.com']), // Duplicate
+          (client) => (client as any).query('INSERT INTO users (email) VALUES ($1)', ['user1@example.com']),
+          (client) => (client as any).query('INSERT INTO users (email) VALUES ($1)', ['user1@example.com']), // Duplicate
         ])
       ).rejects.toThrow(TransactionError);
 
@@ -540,9 +551,9 @@ describe('Repository Transaction Boundaries', () => {
       (unauthorizedError as any).code = 'UNAUTHORIZED';
 
       mockClient.query
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }) // BEGIN
+        .mockResolvedValueOnce(createMockQueryResult()) // BEGIN
         .mockRejectedValueOnce(unauthorizedError)
-        .mockResolvedValueOnce({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 }); // ROLLBACK
+        .mockResolvedValueOnce(createMockQueryResult()); // ROLLBACK
 
       await expect(
         withTransaction(mockPool, async (client) => {
@@ -556,7 +567,7 @@ describe('Repository Transaction Boundaries', () => {
 
   describe('Edge Cases', () => {
     it('should handle empty transaction', async () => {
-      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
+      mockClient.query.mockResolvedValue(createMockQueryResult());
 
       const result = await withTransaction(mockPool, async () => {
         return 'empty';
@@ -568,7 +579,7 @@ describe('Repository Transaction Boundaries', () => {
     });
 
     it('should handle transaction returning null', async () => {
-      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
+      mockClient.query.mockResolvedValue(createMockQueryResult());
 
       const result = await withTransaction(mockPool, async () => {
         return null;
@@ -578,7 +589,7 @@ describe('Repository Transaction Boundaries', () => {
     });
 
     it('should handle transaction returning undefined', async () => {
-      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
+      mockClient.query.mockResolvedValue(createMockQueryResult());
 
       const result = await withTransaction(mockPool, async () => {
         return undefined;
@@ -588,7 +599,7 @@ describe('Repository Transaction Boundaries', () => {
     });
 
     it('should handle very long transactions', async () => {
-      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
+      mockClient.query.mockResolvedValue(createMockQueryResult());
 
       await withTransaction(mockPool, async (client) => {
         for (let i = 0; i < 100; i++) {
