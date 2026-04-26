@@ -7,6 +7,10 @@ type Config = {
   PORT: number;
   DATABASE_URL?: string;
   JWT_SECRET?: string;
+  JWT_SECRET_PREVIOUS?: string;
+  JWT_ISSUER?: string;
+  JWT_AUDIENCE?: string;
+  JWT_CLOCK_TOLERANCE_SECONDS?: number;
   STELLAR_NETWORK: "testnet" | "public";
   STELLAR_HORIZON_URL?: string;
   STELLAR_NETWORK_PASSPHRASE?: string;
@@ -49,11 +53,22 @@ function buildConfig(): Config {
   const STELLAR_NETWORK = normalizeStellarNetwork(process.env.STELLAR_NETWORK);
   const ALLOWED_ORIGINS = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
 
+  const jwtClockTolerance = process.env.JWT_CLOCK_TOLERANCE_SECONDS
+    ? parseInt(process.env.JWT_CLOCK_TOLERANCE_SECONDS, 10)
+    : undefined;
+
   const cfg: Config = {
     NODE_ENV,
     PORT,
     DATABASE_URL: process.env.DATABASE_URL,
     JWT_SECRET: process.env.JWT_SECRET,
+    JWT_SECRET_PREVIOUS: process.env.JWT_SECRET_PREVIOUS,
+    JWT_ISSUER: process.env.JWT_ISSUER,
+    JWT_AUDIENCE: process.env.JWT_AUDIENCE,
+    JWT_CLOCK_TOLERANCE_SECONDS:
+      jwtClockTolerance !== undefined && Number.isFinite(jwtClockTolerance) && jwtClockTolerance >= 0
+        ? jwtClockTolerance
+        : undefined,
     STELLAR_NETWORK,
     STELLAR_HORIZON_URL: process.env.STELLAR_HORIZON_URL,
     STELLAR_NETWORK_PASSPHRASE: process.env.STELLAR_NETWORK_PASSPHRASE,

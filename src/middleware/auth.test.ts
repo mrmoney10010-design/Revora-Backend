@@ -5,6 +5,7 @@ import { hashSessionToken } from '../auth/session';
 import { signJwt } from '../utils/jwt';
 import { issueToken } from '../lib/jwt';
 import { AuthenticatedRequest as LogoutAuthenticatedRequest } from '../auth/logout/types';
+import { AppError } from '../lib/errors';
 
 // ── Shared secret setup ───────────────────────────────────────────────────────
 beforeAll(() => {
@@ -13,6 +14,7 @@ beforeAll(() => {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const SECRET = process.env.JWT_SECRET ?? 'test-secret-that-is-long-enough-32chars!';
+const PREVIOUS_SECRET = 'previous-secret-that-is-long-enough-32chars!!';
 
 function makeJwtToken(
   payload: Record<string, unknown>,
@@ -31,6 +33,15 @@ function mockRes() {
   } as unknown as Response;
 }
 
+/** Helper: assert next() was called with an AppError having the given statusCode */
+function expectAppError(next: jest.Mock, statusCode: number): AppError {
+  expect(next).toHaveBeenCalled();
+  const err = next.mock.calls[0][0] as AppError;
+  expect(err).toBeInstanceOf(AppError);
+  expect(err.statusCode).toBe(statusCode);
+  return err;
+}
+
 // ── requireAuth (feature/change-password-api) ─────────────────────────────────
 describe('requireAuth middleware', () => {
   const mockNext: NextFunction = jest.fn();
@@ -43,6 +54,7 @@ describe('requireAuth middleware', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    delete process.env.JWT_SECRET_PREVIOUS;
 
     sessionRepo = {
       findById: jest.fn().mockResolvedValue(null),
@@ -67,57 +79,136 @@ describe('requireAuth middleware', () => {
 
     await requireAuth(req as Request, res, mockNext);
 
-    expect(mockNext).toHaveBeenCalled();
+    expect(mockNext).toHaveBeenCalledWith();
     expect(req.auth?.userId).toBe('user-123');
     expect(req.auth?.sessionId).toBe('session-abc');
     expect(req.auth?.tokenId).toBe(token);
   });
 
-  it('returns 401 when Authorization header is missing', async () => {
+  it('calls next with 401 AppError when Authorization header is missing', async () => {
     const req = makeReq();
     const res = mockRes();
 
     await requireAuth(req as Request, res, mockNext);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(mockNext).not.toHaveBeenCalled();
+    expectAppError(mockNext, 401);
   });
 
-  it('returns 401 when the header is not Bearer scheme', async () => {
+  it('calls next with 401 AppError when the header is not Bearer scheme', async () => {
     const req = makeReq('Basic dXNlcjpwYXNz');
     const res = mockRes();
 
     await requireAuth(req as Request, res, mockNext);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(mockNext).not.toHaveBeenCalled();
+    expectAppError(mockNext, 401);
   });
 
-  it('returns 401 for an invalid/tampered token', async () => {
+  it('calls next with 401 AppError for an invalid/tampered token', async () => {
     const req = makeReq('Bearer invalid.token.here');
     const res = mockRes();
 
     await requireAuth(req as Request, res, mockNext);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(mockNext).not.toHaveBeenCalled();
+    expectAppError(mockNext, 401);
   });
 
-  it('returns 401 for an expired token', async () => {
+  it('calls next with 401 AppError for an expired token', async () => {
     const token = signJwt({ sub: 'user-123', sid: 'session-abc' }, '-1s');
     const req = makeReq(`Bearer ${token}`);
     const res = mockRes();
 
     await requireAuth(req as Request, res, mockNext);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(mockNext).not.toHaveBeenCalled();
+    expectAppError(mockNext, 401);
+  });
+
+  it('calls next with 401 AppError when session is not found', async () => {
+    const token = signJwt({ sub: 'user-123', sid: 'session-abc' });
+    sessionRepo.findById.mockResolvedValueOnce(null);
+
+    const req = makeReq(`Bearer ${token}`);
+    const res = mockRes();
+
+    await requireAuth(req as Request, res, mockNext);
+
+    expectAppError(mockNext, 401);
+  });
+
+  it('calls next with 401 AppError when session user_id mismatches', async () => {
+    const token = signJwt({ sub: 'user-123', sid: 'session-abc' });
+    sessionRepo.findById.mockResolvedValueOnce({
+      id: 'session-abc',
+      user_id: 'different-user',
+      token_hash: hashSessionToken(token),
+      expires_at: new Date(Date.now() + 10 * 60 * 1000),
+      created_at: new Date(),
+    });
+
+    const req = makeReq(`Bearer ${token}`);
+    const res = mockRes();
+
+    await requireAuth(req as Request, res, mockNext);
+
+    expectAppError(mockNext, 401);
+  });
+
+  it('calls next with 401 AppError when session is expired', async () => {
+    const token = signJwt({ sub: 'user-123', sid: 'session-abc' });
+    sessionRepo.findById.mockResolvedValueOnce({
+      id: 'session-abc',
+      user_id: 'user-123',
+      token_hash: hashSessionToken(token),
+      expires_at: new Date(Date.now() - 10 * 60 * 1000),
+      created_at: new Date(),
+    });
+
+    const req = makeReq(`Bearer ${token}`);
+    const res = mockRes();
+
+    await requireAuth(req as Request, res, mockNext);
+
+    expectAppError(mockNext, 401);
+  });
+
+  it('calls next with 401 AppError when token hash mismatches', async () => {
+    const token = signJwt({ sub: 'user-123', sid: 'session-abc' });
+    sessionRepo.findById.mockResolvedValueOnce({
+      id: 'session-abc',
+      user_id: 'user-123',
+      token_hash: 'wrong-hash',
+      expires_at: new Date(Date.now() + 10 * 60 * 1000),
+      created_at: new Date(),
+    });
+
+    const req = makeReq(`Bearer ${token}`);
+    const res = mockRes();
+
+    await requireAuth(req as Request, res, mockNext);
+
+    expectAppError(mockNext, 401);
+  });
+
+  it('calls next with 500 AppError when JWT_SECRET is not configured', async () => {
+    delete process.env.JWT_SECRET;
+    const token = makeJwtToken({ sub: 'user-1', role: 'investor' });
+    const req = makeReq(`Bearer ${token}`);
+    const res = mockRes();
+
+    await requireAuth(req as Request, res, mockNext);
+
+    expectAppError(mockNext, 500);
+    process.env.JWT_SECRET = SECRET;
   });
 });
 
 // ── authMiddleware (master — JWT factory fn) ──────────────────────────────────
 describe('authMiddleware', () => {
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    delete process.env.JWT_SECRET_PREVIOUS;
+    delete process.env.JWT_ISSUER;
+    delete process.env.JWT_AUDIENCE;
+  });
 
   describe('valid token', () => {
     it('attaches user to request with valid token', () => {
@@ -128,7 +219,7 @@ describe('authMiddleware', () => {
 
       authMiddleware()(req, res, next);
 
-      expect(next).toHaveBeenCalled();
+      expect(next).toHaveBeenCalledWith();
       expect((req as AuthenticatedRequest).user?.sub).toBe('user-123');
       expect((req as AuthenticatedRequest).user?.email).toBe('test@example.com');
     });
@@ -140,52 +231,46 @@ describe('authMiddleware', () => {
 
       authMiddleware()(req, mockRes(), next);
 
-      expect(next).toHaveBeenCalled();
+      expect(next).toHaveBeenCalledWith();
       expect((req as AuthenticatedRequest).user?.sub).toBe('user-456');
     });
   });
 
   describe('missing token', () => {
-    it('returns 401 when Authorization header is missing', () => {
+    it('calls next with 401 AppError when Authorization header is missing', () => {
       const req = { headers: {} } as Request;
       const res = mockRes();
       const next = jest.fn();
 
       authMiddleware()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(401);
-      expect(res.json).toHaveBeenCalledWith({
-        error: 'Unauthorized',
-        message: 'Authorization header missing',
-      });
-      expect(next).not.toHaveBeenCalled();
+      const err = expectAppError(next, 401);
+      expect(err.message).toBe('Authorization header missing');
     });
   });
 
   describe('invalid token', () => {
-    it('returns 401 with invalid token format', () => {
+    it('calls next with 401 AppError for invalid token format', () => {
       const req = { headers: { authorization: 'InvalidFormat token123' } } as Request;
       const res = mockRes();
       const next = jest.fn();
 
       authMiddleware()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(401);
-      expect(next).not.toHaveBeenCalled();
+      expectAppError(next, 401);
     });
 
-    it('returns 401 with malformed token', () => {
+    it('calls next with 401 AppError for malformed token', () => {
       const req = { headers: { authorization: 'Bearer not-a-valid-jwt' } } as Request;
       const res = mockRes();
       const next = jest.fn();
 
       authMiddleware()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(401);
-      expect(next).not.toHaveBeenCalled();
+      expectAppError(next, 401);
     });
 
-    it('returns 401 with wrong secret', () => {
+    it('calls next with 401 AppError for wrong secret', () => {
       const req = {
         headers: {
           authorization:
@@ -197,13 +282,12 @@ describe('authMiddleware', () => {
 
       authMiddleware()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(401);
-      expect(next).not.toHaveBeenCalled();
+      expectAppError(next, 401);
     });
   });
 
   describe('expired token', () => {
-    it('returns 401 with expired token', () => {
+    it('calls next with 401 AppError for expired token', () => {
       const token = issueToken({ subject: 'user-123', expiresIn: '-1s' });
       const req = { headers: { authorization: `Bearer ${token}` } } as Request;
       const res = mockRes();
@@ -211,8 +295,26 @@ describe('authMiddleware', () => {
 
       authMiddleware()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(401);
-      expect(next).not.toHaveBeenCalled();
+      expectAppError(next, 401);
+    });
+  });
+
+  describe('JWT_SECRET misconfiguration', () => {
+    it('calls next with 500 AppError when JWT_SECRET is not set', () => {
+      const original = process.env.JWT_SECRET;
+      delete process.env.JWT_SECRET;
+      const token = issueToken({ subject: 'user-1' });
+      process.env.JWT_SECRET = original;
+      delete process.env.JWT_SECRET;
+
+      const req = { headers: { authorization: `Bearer ${token}` } } as Request;
+      const res = mockRes();
+      const next = jest.fn();
+
+      authMiddleware()(req, res, next);
+
+      expectAppError(next, 500);
+      process.env.JWT_SECRET = original;
     });
   });
 });
@@ -246,13 +348,43 @@ describe('verifyJwt', () => {
     const token = makeJwtToken({ sub: 'user-1', role: 'investor', exp: futureExp });
     expect(verifyJwt(token, SECRET).sub).toBe('user-1');
   });
+
+  // ── Key rotation for verifyJwt ──────────────────────────────────────────────
+
+  describe('key rotation', () => {
+    it('verifies token with current secret when given an array of secrets', () => {
+      const token = makeJwtToken({ sub: 'user-1', role: 'investor' }, SECRET);
+      const payload = verifyJwt(token, [SECRET, PREVIOUS_SECRET]);
+      expect(payload.sub).toBe('user-1');
+    });
+
+    it('verifies token with previous secret when current fails', () => {
+      const token = makeJwtToken({ sub: 'user-rotated', role: 'investor' }, PREVIOUS_SECRET);
+      const payload = verifyJwt(token, [SECRET, PREVIOUS_SECRET]);
+      expect(payload.sub).toBe('user-rotated');
+    });
+
+    it('throws when no secret in the array matches', () => {
+      const token = makeJwtToken({ sub: 'user-1', role: 'investor' }, 'third-secret-not-in-array');
+      expect(() => verifyJwt(token, [SECRET, PREVIOUS_SECRET])).toThrow('Invalid token signature');
+    });
+
+    it('works with a single-element array', () => {
+      const token = makeJwtToken({ sub: 'user-1', role: 'investor' }, SECRET);
+      const payload = verifyJwt(token, [SECRET]);
+      expect(payload.sub).toBe('user-1');
+    });
+  });
 });
 
 // ── requireInvestor ───────────────────────────────────────────────────────────
 describe('requireInvestor', () => {
   const originalSecret = process.env.JWT_SECRET;
 
-  beforeEach(() => { process.env.JWT_SECRET = SECRET; });
+  beforeEach(() => {
+    process.env.JWT_SECRET = SECRET;
+    delete process.env.JWT_SECRET_PREVIOUS;
+  });
   afterEach(() => {
     if (originalSecret === undefined) delete process.env.JWT_SECRET;
     else process.env.JWT_SECRET = originalSecret;
@@ -268,60 +400,63 @@ describe('requireInvestor', () => {
 
     requireInvestor(req, mockRes(), next);
 
-    expect(next).toHaveBeenCalledTimes(1);
+    expect(next).toHaveBeenCalledWith();
     expect((req as AuthenticatedRequest).user).toEqual({ id: 'investor-1', role: 'investor' });
   });
 
-  it('returns 401 when Authorization header is missing', () => {
-    const res = mockRes();
+  it('calls next with 401 AppError when Authorization header is missing', () => {
     const next: NextFunction = jest.fn();
 
-    requireInvestor(makeReq(), res, next);
+    requireInvestor(makeReq(), mockRes(), next);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(next).not.toHaveBeenCalled();
+    expectAppError(next, 401);
   });
 
-  it('returns 401 for Basic auth', () => {
-    const res = mockRes();
+  it('calls next with 401 AppError for Basic auth', () => {
     const next: NextFunction = jest.fn();
 
-    requireInvestor(makeReq('Basic some-credentials'), res, next);
+    requireInvestor(makeReq('Basic some-credentials'), mockRes(), next);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(next).not.toHaveBeenCalled();
+    expectAppError(next, 401);
   });
 
-  it('returns 401 for an invalid token', () => {
-    const res = mockRes();
+  it('calls next with 401 AppError for an invalid token', () => {
     const next: NextFunction = jest.fn();
 
-    requireInvestor(makeReq('Bearer invalid.token.here'), res, next);
+    requireInvestor(makeReq('Bearer invalid.token.here'), mockRes(), next);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(next).not.toHaveBeenCalled();
+    expectAppError(next, 401);
   });
 
-  it('returns 403 for a non-investor role', () => {
+  it('calls next with 403 AppError for a non-investor role', () => {
     const token = makeJwtToken({ sub: 'admin-1', role: 'admin' });
-    const res = mockRes();
     const next: NextFunction = jest.fn();
 
-    requireInvestor(makeReq(`Bearer ${token}`), res, next);
+    requireInvestor(makeReq(`Bearer ${token}`), mockRes(), next);
 
-    expect(res.status).toHaveBeenCalledWith(403);
-    expect(next).not.toHaveBeenCalled();
+    expectAppError(next, 403);
   });
 
-  it('returns 500 when JWT_SECRET is not set', () => {
+  it('calls next with 500 AppError when JWT_SECRET is not set', () => {
     delete process.env.JWT_SECRET;
     const token = makeJwtToken({ sub: 'investor-1', role: 'investor' });
-    const res = mockRes();
     const next: NextFunction = jest.fn();
 
-    requireInvestor(makeReq(`Bearer ${token}`), res, next);
+    requireInvestor(makeReq(`Bearer ${token}`), mockRes(), next);
 
-    expect(res.status).toHaveBeenCalledWith(500);
-    expect(next).not.toHaveBeenCalled();
+    expectAppError(next, 500);
+  });
+
+  it('verifies investor token signed with previous secret when JWT_SECRET_PREVIOUS is set', () => {
+    const token = makeJwtToken({ sub: 'investor-1', role: 'investor' }, PREVIOUS_SECRET);
+    process.env.JWT_SECRET_PREVIOUS = PREVIOUS_SECRET;
+
+    const req = makeReq(`Bearer ${token}`);
+    const next: NextFunction = jest.fn();
+
+    requireInvestor(req, mockRes(), next);
+
+    expect(next).toHaveBeenCalledWith();
+    expect((req as AuthenticatedRequest).user).toEqual({ id: 'investor-1', role: 'investor' });
   });
 });

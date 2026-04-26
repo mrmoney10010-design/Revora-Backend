@@ -12,7 +12,8 @@ import { createHealthRouter } from './routes/health';
 import { UserRepository } from './db/repositories/userRepository';
 import { JwtIssuer, UserRole, UserRepository as IUserRepository, SessionRepository as ISessionRepository } from './auth/login/types';
 import { LoginService } from './auth/login/loginService';
-import { issueToken } from './lib/jwt';
+import { issueToken, getDefaultClaimValidationOptions } from './lib/jwt';
+import { errorHandler } from './middleware/errorHandler';
 
 // Adapter to convert database User to login service UserRecord
 class UserRepositoryAdapter implements IUserRepository {
@@ -89,6 +90,9 @@ export function createApp() {
   app.use(createLogoutRouter({ requireAuth, sessionRepository }));
   app.use(createChangePasswordRouter({ requireAuth, db: pool }));
   app.use('/api/v1/health', createHealthRouter(pool));
+
+  // Global error handler — must be mounted after all routes
+  app.use(errorHandler);
 
   return app;
 }
