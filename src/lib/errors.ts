@@ -28,26 +28,60 @@ export interface ErrorResponse {
  * Provides a consistent structure for error handling, including HTTP status codes.
  */
 export class AppError extends Error {
-  public readonly name: string;
-  public readonly httpCode: number;
-  public readonly isOperational: boolean;
+  public readonly name: string = 'AppError';
+  public readonly code: ErrorCode;
+  public readonly statusCode: number;
+  public readonly details?: unknown;
+  public readonly expose?: boolean;
 
-  constructor(name: string, httpCode: number, message: string, isOperational: boolean = true) {
+  constructor(
+    code: ErrorCode,
+    message: string,
+    statusCode: number,
+    details?: unknown,
+    options?: { expose?: boolean }
+  ) {
     super(message);
     Object.setPrototypeOf(this, new.target.prototype); // Restore prototype chain
-    this.name = name;
-    this.httpCode = httpCode;
-    this.isOperational = isOperational;
+    this.code = code;
+    this.statusCode = statusCode;
+    this.details = details;
+    this.expose = options?.expose;
     Error.captureStackTrace(this, this.constructor);
+  }
+
+  toResponse(): ErrorResponse {
+    const response: ErrorResponse = {
+      code: this.code,
+      message: this.message,
+    };
+    if (this.details !== undefined) {
+      response.details = this.details;
+    }
+    return response;
   }
 }
 
+export function createError(
+  code: ErrorCode,
+  message: string,
+  statusCode: number,
+  details?: unknown,
+  options?: { expose?: boolean }
+): AppError {
+  return new AppError(code, message, statusCode, details, options);
+}
+
 export class NotFoundError extends AppError {
-  constructor(message: string = 'Not Found') { super('NotFoundError', 404, message); }
+  constructor(message: string = 'Not Found') { super(ErrorCode.NOT_FOUND, message, 404); }
 }
 
 export class UnauthorizedError extends AppError {
-  constructor(message: string = 'Unauthorized') { super('UnauthorizedError', 401, message); }
+  constructor(message: string = 'Unauthorized') { super(ErrorCode.UNAUTHORIZED, message, 401); }
+}
+
+export class BadRequestError extends AppError {
+  constructor(message: string = 'Bad Request') { super(ErrorCode.BAD_REQUEST, message, 400); }
 }
 
 /** Convenience factories for common error scenarios. */
@@ -100,6 +134,6 @@ export function throwError(
   throw createError(code, message, statusCode, details, options);
 }
 
-export class BadRequestError extends AppError {
-  constructor(message: string = 'Bad Request') { super('BadRequestError', 400, message); }
+export function sendAppError(next: NextFunction, error: AppError): void {
+  next(error);
 }
