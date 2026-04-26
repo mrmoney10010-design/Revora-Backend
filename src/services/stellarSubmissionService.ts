@@ -1,15 +1,7 @@
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { env } from '../config/env';
-import { 
-  classifyStellarRPCFailure, 
-  shouldRetryStellarRPCFailure,
-  createStellarErrorResponse,
-  StellarRPCFailureContext,
-  StellarRPCFailure,
-  StellarRPCFailureClass 
-} from '../lib/stellarRpcFailure';
-import { AppError, Errors } from '../lib/errors';
-import { globalLogger as logger } from '../lib/logger';
+import { globalLogger } from '../lib/logger';
+import { Errors } from '../lib/errors';
 
 /**
  * Service for building and submitting Stellar transactions.
@@ -23,10 +15,7 @@ import { globalLogger as logger } from '../lib/logger';
 export class StellarSubmissionService {
   private server: StellarSdk.rpc.Server;
   private keypair: StellarSdk.Keypair;
-  private submittedTransactionHashes = new Set<string>();
-  private readonly maxRetries = 3;
-  private readonly baseDelayMs = 1000;
-  private readonly maxDelayMs = 30000;
+  private logger = globalLogger.child({ service: 'stellar-submission' });
 
   constructor() {
     const horizonUrl =
@@ -39,14 +28,21 @@ export class StellarSubmissionService {
 
     const secret = process.env.STELLAR_SERVER_SECRET;
     if (!secret) {
-      throw new Error('STELLAR_SERVER_SECRET is not defined in environment variables');
+      throw Errors.internal('STELLAR_SERVER_SECRET is not defined in environment variables');
     }
 
     try {
       this.keypair = StellarSdk.Keypair.fromSecret(secret);
     } catch {
-      throw new Error('Invalid STELLAR_SERVER_SECRET provided');
+      throw Errors.internal('Invalid STELLAR_SERVER_SECRET provided');
     }
+
+    this.logger.info('Stellar submission service initialized', {
+      serverUrl: horizonUrl,
+      publicKey: this.keypair.publicKey(),
+      network: env.STELLAR_NETWORK,
+      maxFee: env.STELLAR_MAX_FEE,
+    });
   }
 
   /**
@@ -63,20 +59,25 @@ export class StellarSubmissionService {
     asset: StellarSdk.Asset = StellarSdk.Asset.native(),
     idempotencyKey?: string,
   ) {
-    const context: StellarRPCFailureContext = {
-      operation: 'submit_payment',
-      network: env.STELLAR_NETWORK === 'public' ? 'public' : 'testnet',
-      attemptCount: 1,
-      idempotencyKey,
-    };
+    if (!to || typeof to !== 'string') {
+      throw Errors.validationError('Destination public key must be a non-empty string');
+    }
+    if (!amount || typeof amount !== 'string') {
+      throw Errors.validationError('Amount must be a non-empty string');
+    }
+
+    this.logger.info('Submitting payment transaction', {
+      to,
+      amount,
+      asset: asset.isNative() ? 'XLM' : asset.getAssetCode(),
+    });
 
     try {
-      const sourceAccount = await this.getAccountWithRetry(this.keypair.publicKey(), context);
+      const sourceAccount = await this.server.getAccount(this.keypair.publicKey());
 
       const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-        fee: StellarSdk.BASE_FEE,
-        networkPassphrase:
-          env.STELLAR_NETWORK_PASSPHRASE ||
+        fee: env.STELLAR_MAX_FEE.toString(),
+        networkPassphrase: env.STELLAR_NETWORK_PASSPHRASE ||
           (env.STELLAR_NETWORK === 'public'
             ? StellarSdk.Networks.PUBLIC
             : StellarSdk.Networks.TESTNET),
@@ -107,33 +108,27 @@ export class StellarSubmissionService {
         });
       }
 
-      const result = await this.sendTransactionWithRetry(transaction, context);
-      
-      // Mark transaction as submitted to prevent duplicates
-      this.submittedTransactionHashes.add(transactionHash);
-      
+      const result = await this.server.sendTransaction(transaction);
+
+      this.logger.info('Payment transaction submitted successfully', {
+        to,
+        amount,
+        transactionHash: result.hash,
+      });
+
       return result;
     } catch (error) {
-      const failure = classifyStellarRPCFailure(error, context);
-      this.logStellarFailure(failure);
-      
-      if (failure.class === StellarRPCFailureClass.INSUFFICIENT_FUNDS) {
-        throw Errors.badRequest('Insufficient funds for payment', {
-          operation: context.operation,
-          amount,
-          asset: asset.getCode(),
-        });
+      this.logger.error('Payment transaction failed', {
+        to,
+        amount,
+        error: error,
+      });
+
+      if (error instanceof Error && error.name === 'AppError') {
+        throw error;
       }
-      
-      if (failure.class === StellarRPCFailureClass.VALIDATION_ERROR) {
-        throw Errors.validationError('Invalid payment parameters', {
-          destination: to,
-          amount,
-          asset: asset.getCode(),
-        });
-      }
-      
-      throw this.createAppErrorFromFailure(failure);
+
+      throw Errors.serviceUnavailable('Failed to submit payment transaction');
     }
   }
 
@@ -146,96 +141,15 @@ export class StellarSubmissionService {
    * @returns Transaction result
    */
   async invokeContract(
-    contractId: string,
-    functionName: string,
-    args: any[] = [],
-    idempotencyKey?: string,
-  ): Promise<any> {
-    const context: StellarRPCFailureContext = {
-      operation: 'invoke_contract',
-      network: env.STELLAR_NETWORK === 'public' ? 'public' : 'testnet',
-      attemptCount: 1,
-      contractId,
-      functionName,
-      idempotencyKey,
-    };
-
-    try {
-      // Get account for transaction
-      const sourceAccount = await this.getAccountWithRetry(this.keypair.publicKey(), context);
-
-      // Build Soroban transaction
-      const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-        fee: StellarSdk.BASE_FEE,
-        networkPassphrase:
-          env.STELLAR_NETWORK_PASSPHRASE ||
-          (env.STELLAR_NETWORK === 'public'
-            ? StellarSdk.Networks.PUBLIC
-            : StellarSdk.Networks.TESTNET),
-      })
-        .addOperation(
-          StellarSdk.Operation.invokeContractFunction({
-            contract: contractId,
-            function: functionName,
-            args: args,
-          })
-        )
-        .setTimeout(30)
-        .build();
-
-      transaction.sign(this.keypair);
-      
-      // Check for idempotency to prevent duplicate submissions
-      const transactionHash = transaction.hash().toString('hex');
-      if (this.submittedTransactionHashes.has(transactionHash)) {
-        logger.warn('Duplicate contract invocation prevented', {
-          transactionHash,
-          contractId,
-          functionName,
-          idempotencyKey,
-          operation: 'invoke_contract',
-        });
-        throw Errors.conflict('Contract invocation already submitted', {
-          hash: transactionHash,
-          contractId,
-          functionName,
-          idempotencyKey,
-        });
-      }
-
-      const result = await this.sendTransactionWithRetry(transaction, context);
-      
-      // Mark transaction as submitted to prevent duplicates
-      this.submittedTransactionHashes.add(transactionHash);
-
-      // Parse and return contract result
-      if (result.status === 'PENDING') {
-        return result; // Return the full transaction response
-      } else {
-        throw new Error(`Contract invocation failed: ${result.status}`);
-      }
-    } catch (error) {
-      const failure = classifyStellarRPCFailure(error, context);
-      this.logStellarFailure(failure);
-      
-      if (failure.class === StellarRPCFailureClass.CONTRACT_ERROR) {
-        throw Errors.badRequest('Contract execution failed', {
-          contractId,
-          functionName,
-          args,
-        });
-      }
-      
-      if (failure.class === StellarRPCFailureClass.VALIDATION_ERROR) {
-        throw Errors.validationError('Invalid contract parameters', {
-          contractId,
-          functionName,
-          args,
-        });
-      }
-      
-      throw this.createAppErrorFromFailure(failure);
-    }
+    _contractId: string,
+    _functionName: string,
+    _args: any[] = [],
+  ): Promise<never> {
+    this.logger.warn('Soroban contract invocation attempted but not implemented', {
+      contractId: _contractId,
+      functionName: _functionName,
+    });
+    throw Errors.serviceUnavailable('Soroban contract invocation not implemented yet');
   }
 
   /**
