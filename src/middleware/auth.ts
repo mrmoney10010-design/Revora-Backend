@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction, RequestHandler } from 'express';
-import { verifyToken, JwtPayload } from '../lib/jwt';
+import { verifyToken, JwtPayload, getDefaultClaimValidationOptions, getJwtSecretsForVerification } from '../lib/jwt';
 import crypto from 'crypto';
 import { AuthContext, AuthenticatedRequest as LogoutAuthenticatedRequest } from '../auth/logout/types';
 import { SessionRepository as DbSessionRepository } from '../db/repositories/sessionRepository';
@@ -21,7 +21,7 @@ export interface AuthenticatedRequest extends Request {
 
 // ── authMiddleware (Bearer JWT via lib/jwt) ───────────────────────────────────
 export function authMiddleware(): RequestHandler {
-  return (req: Request, res: Response, next: NextFunction) => {
+  return (req: Request, _res: Response, next: NextFunction) => {
     const authHeader = req.headers.authorization;
 
     if (!authHeader) {
@@ -40,7 +40,8 @@ export function authMiddleware(): RequestHandler {
     const token = parts[1];
 
     try {
-      const payload = verifyToken(token);
+      const claimOpts = getDefaultClaimValidationOptions();
+      const payload = verifyToken(token, claimOpts);
       (req as AuthenticatedRequest).user = {
         ...payload,
         sub: payload.sub,
@@ -48,10 +49,9 @@ export function authMiddleware(): RequestHandler {
       };
       next();
     } catch (error) {
-      let errorMessage = 'Invalid or expired token';
-      if (error instanceof Error) {
-        if (error.name === 'TokenExpiredError') errorMessage = 'Token has expired';
-        else if (error.name === 'JsonWebTokenError') errorMessage = 'Invalid token signature';
+      if (error instanceof Error && error.message.includes('JWT_SECRET')) {
+        next(Errors.internal('Server configuration error'));
+        return;
       }
       globalLogger.warn('Auth failed: JWT verification error', {
         error: error instanceof Error ? error.message : 'Unknown error',
@@ -81,7 +81,8 @@ export function optionalAuthMiddleware(): RequestHandler {
     }
 
     try {
-      const payload = verifyToken(parts[1]);
+      const claimOpts = getDefaultClaimValidationOptions();
+      const payload = verifyToken(parts[1], claimOpts);
       (req as AuthenticatedRequest).user = {
         ...payload,
         sub: payload.sub,
@@ -104,22 +105,42 @@ interface JwtPayloadInternal {
   exp?: number;
 }
 
-export function verifyJwt(token: string, secret: string): JwtPayloadInternal {
+/**
+ * @notice Verify a JWT using raw HMAC-SHA256 with key rotation support.
+ * @dev Accepts a single secret or an array of secrets (current first, previous second).
+ *      The first secret that produces a valid signature wins.
+ * @param token JWT string to verify.
+ * @param secretOrSecrets One or more HMAC secrets to try, in priority order.
+ * @returns Decoded payload if signature and expiry are valid.
+ * @throws {Error} If the token format, signature, or expiry is invalid.
+ */
+export function verifyJwt(token: string, secretOrSecrets: string | string[]): JwtPayloadInternal {
+  const secrets = Array.isArray(secretOrSecrets) ? secretOrSecrets : [secretOrSecrets];
   const parts = token.split('.');
   if (parts.length !== 3) throw new Error('Invalid token format');
 
   const [headerB64, payloadB64, signatureB64] = parts;
 
-  const expectedSig = crypto
-    .createHmac('sha256', secret)
-    .update(`${headerB64}.${payloadB64}`)
-    .digest('base64url');
+  let payload: JwtPayloadInternal | null = null;
+  for (const secret of secrets) {
+    const expectedSig = crypto
+      .createHmac('sha256', secret)
+      .update(`${headerB64}.${payloadB64}`)
+      .digest('base64url');
 
-  if (expectedSig !== signatureB64) throw new Error('Invalid token signature');
+    if (expectedSig === signatureB64) {
+      try {
+        payload = JSON.parse(
+          Buffer.from(payloadB64, 'base64url').toString('utf8'),
+        ) as JwtPayloadInternal;
+        break;
+      } catch {
+        continue;
+      }
+    }
+  }
 
-  const payload: JwtPayloadInternal = JSON.parse(
-    Buffer.from(payloadB64, 'base64url').toString('utf8'),
-  );
+  if (!payload) throw new Error('Invalid token signature');
 
   if (payload.exp !== undefined && payload.exp < Math.floor(Date.now() / 1000)) {
     throw new Error('Token expired');
@@ -129,7 +150,7 @@ export function verifyJwt(token: string, secret: string): JwtPayloadInternal {
 }
 
 // ── requireInvestor ───────────────────────────────────────────────────────────
-export function requireInvestor(req: Request, res: Response, next: NextFunction): void {
+export function requireInvestor(req: Request, _res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     globalLogger.warn('Auth failed: Missing or invalid Bearer token for investor route', {
@@ -149,7 +170,8 @@ export function requireInvestor(req: Request, res: Response, next: NextFunction)
   }
 
   try {
-    const payload = verifyJwt(token, secret);
+    const secrets = getJwtSecretsForVerification();
+    const payload = verifyJwt(token, secrets);
     if (payload.role !== 'investor') {
       globalLogger.warn('Auth failed: Forbidden role for investor route', {
         role: payload.role,
@@ -175,7 +197,7 @@ export function requireInvestor(req: Request, res: Response, next: NextFunction)
 // this const shadows the factory fn for issuer-only routes.
 export const requireIssuerAuth = (
   req: AuthenticatedRequest,
-  res: Response,
+  _res: Response,
   next: NextFunction,
 ): void => {
   const issuerId = req.header('X-Issuer-Id');
@@ -190,7 +212,7 @@ export const requireIssuerAuth = (
 
 // ── createRequireAuth (session-hardened)
 export function createRequireAuth(sessionRepository: DbSessionRepository): RequestHandler {
-  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  return async (req: Request, _res: Response, next: NextFunction): Promise<void> => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       globalLogger.warn('Auth failed: Missing or invalid Authorization header', { path: req.path });
@@ -202,7 +224,8 @@ export function createRequireAuth(sessionRepository: DbSessionRepository): Reque
     let payload: JwtPayload;
 
     try {
-      payload = verifyToken(token);
+      const claimOpts = getDefaultClaimValidationOptions();
+      payload = verifyToken(token, claimOpts);
     } catch (err) {
       globalLogger.warn('Auth failed: JWT verification error', {
         error: err instanceof Error ? err.message : 'Unknown error',

@@ -121,5 +121,8 @@ export function createApp() {
   // Offering sync routes
   app.use('/api/v1/offerings', createOfferingSyncRouter());
 
+  // Global error handler — must be mounted after all routes
+  app.use(errorHandler);
+
   return app;
 }
