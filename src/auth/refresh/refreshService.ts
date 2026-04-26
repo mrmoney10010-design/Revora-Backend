@@ -1,4 +1,7 @@
 import crypto from 'node:crypto';
+import { Pool } from 'pg';
+import { withTransaction } from '../../db/transaction';
+import { Logger } from '../../lib/logger';
 import {
     RefreshSuccessResponse,
     RefreshTokenRepository,
@@ -44,59 +47,86 @@ export class RefreshService {
     constructor(
         private readonly repository: RefreshTokenRepository,
         private readonly tokenService: TokenService,
+        private readonly db: Pool,
+        private readonly logger: Logger = new Logger(),
     ) {}
 
     /**
-     * Rotate a refresh token.
-     *
-     * @param token - The raw refresh token from the client.
-     * @returns     A new `{ accessToken, refreshToken }` pair on success,
-     *              or `null` when the token is invalid, reused, or concurrently
-     *              consumed.
+     * Rotate a refresh token with concurrent refresh protection.
+     * Uses database transactions to prevent race conditions where
+     * multiple simultaneous refresh requests could bypass reuse detection.
      */
     async refresh(token: string): Promise<RefreshSuccessResponse | null> {
-        // 1. Verify token signature / expiry
+        // 1. Verify token (outside transaction - stateless)
         let payload;
         try {
             payload = this.tokenService.verifyRefreshToken(token);
-        } catch {
+        } catch (error) {
+            this.logger.warn('Refresh token verification failed', {
+                error: error instanceof Error ? error.message : String(error),
+                tokenPrefix: token.substring(0, 10) + '...',
+            });
             return null;
         }
 
         const { sessionId, userId, role } = payload;
 
-        // 2. Concurrent-use guard ─────────────────────────────────────────────
-        //    If another request is already processing this session, treat it as
-        //    a reuse attempt and revoke the session tree immediately.
-        if (this.inFlightSessions.has(sessionId)) {
-            // Revoke on best-effort basis; ignore errors — session is toast either way.
-            await this.repository.revokeSessionAndDescendants(sessionId).catch(() => undefined);
-            return null;
-        }
+        this.logger.info('Processing refresh request', {
+            userId,
+            sessionId,
+            role,
+        });
 
-        this.inFlightSessions.add(sessionId);
-
-        try {
-            // 3. Find session
-            const session = await this.repository.findSessionById(sessionId);
+        // 2. Execute refresh logic within transaction for atomicity
+        return withTransaction(this.db, async (client) => {
+            // 2a. Find and lock parent session for update (prevents concurrent refresh)
+            const session = await this.repository.findSessionByIdForUpdate(sessionId, client);
             if (!session) {
+                this.logger.warn('Session not found during refresh', {
+                    userId,
+                    sessionId,
+                });
                 return null;
             }
 
-            // 4. Reuse detection: session already explicitly revoked
+            // 2b. Validate token hash matches what's stored (prevents replay attacks)
+            const incomingTokenHash = this.tokenService.hashToken(token);
+            if (session.token_hash !== incomingTokenHash) {
+                this.logger.warn('Token hash mismatch during refresh', {
+                    userId,
+                    sessionId,
+                    storedHash: session.token_hash.substring(0, 10) + '...',
+                    incomingHash: incomingTokenHash.substring(0, 10) + '...',
+                });
+                // Token hash mismatch - revoke the session family
+                await this.repository.revokeSessionAndDescendants(sessionId, client);
+                return null;
+            }
+
+            // 2c. Check if session is already revoked
             if (session.revoked_at) {
-                await this.repository.revokeSessionAndDescendants(sessionId);
+                this.logger.warn('Attempted refresh on revoked session', {
+                    userId,
+                    sessionId,
+                    revokedAt: session.revoked_at,
+                });
+                await this.repository.revokeSessionAndDescendants(sessionId, client);
                 return null;
             }
 
-            // 5. Reuse detection: session already has a child (token was used)
-            const childSession = await this.repository.findSessionByParentId(sessionId);
+            // 2d. Check for reuse detection: if this session already has a child
+            const childSession = await this.repository.findSessionByParentId(sessionId, client);
             if (childSession) {
-                await this.repository.revokeSessionAndDescendants(sessionId);
+                this.logger.warn('Token reuse detected during refresh', {
+                    userId,
+                    sessionId,
+                    childSessionId: childSession.id,
+                });
+                await this.repository.revokeSessionAndDescendants(sessionId, client);
                 return null;
             }
 
-            // 6. Generate new session ID and token pair
+            // 2d. Generate new session ID and tokens
             const newSessionId = crypto.randomUUID();
             const tokens = this.tokenService.issueTokens({
                 userId,
@@ -104,10 +134,10 @@ export class RefreshService {
                 role,
             });
 
-            // 7. Persist new session linked to the current one as parent
+            // 2e. Create new session for the new refresh token
             const newTokenHash = this.tokenService.hashToken(tokens.refreshToken);
             const expiresAt = new Date();
-            expiresAt.setDate(expiresAt.getDate() + 7); // 7-day refresh window
+            expiresAt.setDate(expiresAt.getDate() + 7); // 7 days
 
             await this.repository.createSession({
                 id: newSessionId,
@@ -115,12 +145,23 @@ export class RefreshService {
                 token_hash: newTokenHash,
                 expires_at: expiresAt,
                 parent_id: sessionId,
+            }, client);
+
+            this.logger.info('Refresh token rotated successfully', {
+                userId,
+                oldSessionId: sessionId,
+                newSessionId,
+                role,
             });
 
             return tokens;
-        } finally {
-            // Always release the in-flight lock — even if the DB call above fails.
-            this.inFlightSessions.delete(sessionId);
-        }
+        }).catch((error) => {
+            this.logger.error('Refresh transaction failed', {
+                userId,
+                sessionId,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+        });
     }
 }
