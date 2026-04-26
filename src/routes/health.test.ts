@@ -166,6 +166,32 @@ describe('healthReadyHandler', () => {
       },
     });
   });
+
+  it('catches and surfaces fetch exceptions deterministically', async () => {
+    const db = { query: jest.fn().mockResolvedValue({ rows: [{ '?column?': 1 }] }) };
+    const networkError = new Error('network timeout');
+    networkError.name = 'AbortError';
+    global.fetch = jest.fn().mockRejectedValue(networkError) as typeof fetch;
+
+    const app = express();
+    app.use('/health', createHealthRouter(db));
+    app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      const mapped = err as { statusCode: number; toResponse: () => unknown };
+      res.status(mapped.statusCode).json(mapped.toResponse());
+    });
+
+    const response = await request(app).get('/health/ready');
+
+    expect(response.status).toBe(503);
+    expect(response.body).toEqual({
+      code: ErrorCode.SERVICE_UNAVAILABLE,
+      message: 'Dependency unavailable',
+      details: {
+        dependency: 'stellar-horizon',
+        failureClass: StellarRPCFailureClass.TIMEOUT,
+      },
+    });
+  });
 });
 
 describe('offering validation matrix', () => {
