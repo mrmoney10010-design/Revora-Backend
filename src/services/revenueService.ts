@@ -71,6 +71,70 @@ export class RevenueService {
             input.periodStart,
             input.periodEnd
         );
+      }
+    } catch (error) {
+      this.logger.warn('Invalid revenue amount format', { offeringId, amount, error: error instanceof Error ? error.message : String(error) });
+      if (error instanceof AppError) throw error;
+      throw new AppError(
+        ErrorCode.VALIDATION_ERROR,
+        `Invalid revenue amount: ${amount}`,
+        400,
+        { field: 'amount', value: amount }
+      );
+    }
+
+    // 2. Validate period dates
+    const startDate = new Date(periodStart);
+    const endDate = new Date(periodEnd);
+
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      throw new AppError(
+        ErrorCode.VALIDATION_ERROR,
+        'Invalid date format for periodStart or periodEnd. Must be ISO 8601.',
+        400,
+        { periodStart, periodEnd }
+      );
+    }
+
+    if (startDate >= endDate) {
+      throw new AppError(
+        ErrorCode.VALIDATION_ERROR,
+        'periodEnd must be after periodStart.',
+        400,
+        { periodStart, periodEnd }
+      );
+    }
+
+    // 3. Convert amount to Soroban i128 scaled BigInt
+    let amountI128: BigInt;
+    try {
+      amountI128 = decimalAmount.toSorobanI128(SOROBAN_I128_SCALE);
+    } catch (error) {
+      this.logger.error('Failed to convert decimal amount to Soroban i128', { offeringId, amount, error: error instanceof Error ? error.message : String(error) });
+      if (error instanceof AppError) throw error;
+      throw new AppError(
+        ErrorCode.INTERNAL_ERROR,
+        'Failed to process revenue amount for Soroban.',
+        500,
+        { offeringId, amount }
+      );
+    }
+
+    // 4. Submit to Stellar/Soroban
+    let transactionId: string;
+    try {
+      transactionId = await this.stellarService.submitRevenueToSoroban(
+        offeringId,
+        amountI128,
+        startDate,
+        endDate
+      );
+      this.logger.info('Revenue submitted to Soroban', { offeringId, amount, amountI128: amountI128.toString(), transactionId });
+    } catch (error) {
+      this.logger.error('Stellar RPC submission failed', { offeringId, amount, error: error instanceof Error ? error.message : String(error) });
+      // Use a utility to classify Stellar RPC failures into AppErrors
+      throw this.classifyStellarRPCFailure(error);
+    }
 
         if (overlapping) {
             throw Errors.conflict(
@@ -105,4 +169,13 @@ export class RevenueService {
             periodEnd: report.period_end,
         });
     }
+
+    // Generic fallback for unclassified errors
+    this.logger.error('Unclassified Stellar RPC error', { error });
+    return new AppError(
+      ErrorCode.INTERNAL_ERROR,
+      'An unexpected error occurred while interacting with the Stellar network.',
+      500
+    );
+  }
 }

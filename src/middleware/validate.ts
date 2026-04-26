@@ -2,6 +2,7 @@ import { Request, Response, NextFunction, RequestHandler } from 'express';
 import { Errors } from '../lib/errors';
 
 type PrimitiveType = 'string' | 'number' | 'boolean';
+import { Request, Response, NextFunction } from 'express';
 
 export type FieldSchema = {
   type: PrimitiveType;
@@ -158,3 +159,8 @@ export function validate(arg: ObjectSchema | ValidateOptions): RequestHandler[] 
   return validateBody(arg as ObjectSchema);
 }
 
+/**
+ * @interface ValidationRule
+ * @description Defines a validation rule for a single field.
+ * @property {boolean} required - True if the field is mandatory.
+ * @property
