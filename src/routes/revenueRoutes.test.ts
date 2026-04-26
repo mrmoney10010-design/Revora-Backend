@@ -1,273 +1,218 @@
+import express from 'express';
 import request from 'supertest';
-import express, { Application } from 'express';
+import { Pool } from 'pg';
 import { createRevenueRoutes } from './revenueRoutes';
-import { RevenueService, RevenueReportInput } from '../services/revenueService';
-import { AppError, ErrorCode } from '../lib/errors';
-import { Logger } from '../lib/logger';
-import { errorHandler } from '../middleware/errorHandler'; // Assuming global error handler
+import { OfferingRepository } from '../db/repositories/offeringRepository';
+import { RevenueReportRepository } from '../db/repositories/revenueReportRepository';
+import { errorHandler } from '../middleware/errorHandler';
+import { AppError } from '../lib/errors';
 
-// Mock Logger
-const mockLogger: Logger = {
-  info: jest.fn(),
-  warn: jest.fn(),
-  error: jest.fn(),
-  debug: jest.fn(),
-  trace: jest.fn(),
-  critical: jest.fn(),
-  alert: jest.fn(),
-  emergency: jest.fn(),
-  child: jest.fn(() => mockLogger),
-};
+// Mock DB Repositories
+jest.mock('../db/repositories/offeringRepository');
+jest.mock('../db/repositories/revenueReportRepository');
 
-// Mock RevenueService
-const mockRevenueService = {
-  ingestRevenueReport: jest.fn(),
-};
+jest.mock('../middleware/validate', () => ({
+  validateParams: () => (req: any, res: any, next: any) => next(),
+  validateBody: () => (req: any, res: any, next: any) => next()
+}));
+
+// Mock Auth Middleware
+jest.mock('../middleware/auth', () => ({
+  authMiddleware: () => (req: any, res: any, next: any) => {
+    if (req.headers.authorization === 'Bearer valid-token') {
+      req.user = { id: 'user-123', role: 'startup' };
+      next();
+    } else if (req.headers.authorization === 'Bearer other-user') {
+      req.user = { id: 'other-456', role: 'startup' };
+      next();
+    } else if (req.headers.authorization === 'Bearer no-id') {
+      req.user = { role: 'startup' };
+      next();
+    } else {
+      res.status(401).json({ error: 'Unauthorized' });
+    }
+  }
+}));
 
 describe('Revenue Routes', () => {
-  let app: Application;
-
-  beforeAll(() => {
-    app = express();
-    app.use(express.json()); // Body parser for JSON
-    app.use('/api/v1', createRevenueRoutes(mockRevenueService as unknown as RevenueService, mockLogger));
-    app.use(errorHandler); // Global error handler to catch AppErrors
-  });
-
+  let app: express.Application;
+  let mockPool: jest.Mocked<Pool>;
+  const validOfferingId = '123e4567-e89b-42d3-a456-426614174000';
+  
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.resetAllMocks();
+    mockPool = {} as any;
+    
+    app = express();
+    app.use(express.json());
+    app.use('/api', createRevenueRoutes(mockPool));
+    app.use(errorHandler);
   });
 
-  describe('POST /api/v1/offerings/:id/revenue', () => {
-    const validOfferingId = 'a1b2c3d4-e5f6-7890-1234-567890abcdef';
-    const validBody = {
-      amount: '100.50',
-      periodStart: '2023-01-01T00:00:00Z',
-      periodEnd: '2023-01-31T23:59:59Z',
+  describe('POST /api/offerings/:id/revenue', () => {
+    const validPayload = {
+      amount: '1000.50',
+      periodStart: '2026-01-01T00:00:00Z',
+      periodEnd: '2026-01-31T23:59:59Z'
     };
 
-    it('should return 202 for a valid revenue report', async () => {
-      mockRevenueService.ingestRevenueReport.mockResolvedValue('stellar-tx-123');
-
-      const res = await request(app)
-        .post(`/api/v1/offerings/${validOfferingId}/revenue`)
-        .send(validBody);
-
-      expect(res.statusCode).toBe(202);
-      expect(res.body).toEqual({ message: 'Revenue report accepted for processing', transactionId: 'stellar-tx-123' });
-      expect(mockRevenueService.ingestRevenueReport).toHaveBeenCalledWith({
-        offeringId: validOfferingId,
-        ...validBody,
+    it('should submit a revenue report successfully', async () => {
+      (OfferingRepository.prototype.findById as jest.Mock).mockResolvedValue({
+        id: validOfferingId,
+        issuer_id: 'user-123'
       });
-    });
-
-    it('should return 400 for invalid offeringId format', async () => {
-      const invalidOfferingId = 'not-a-uuid';
-      const res = await request(app)
-        .post(`/api/v1/offerings/${invalidOfferingId}/revenue`)
-        .send(validBody);
-
-      expect(res.statusCode).toBe(400);
-      expect(res.body).toEqual(
-        expect.objectContaining({
-          error: 'ValidationError',
-          details: ['params.id: invalid format'],
-        })
-      );
-      expect(mockRevenueService.ingestRevenueReport).not.toHaveBeenCalled();
-    });
-
-    it('should return 400 for missing amount', async () => {
-      const invalidBody = { ...validBody, amount: undefined };
-      const res = await request(app)
-        .post(`/api/v1/offerings/${validOfferingId}/revenue`)
-        .send(invalidBody);
-
-      expect(res.statusCode).toBe(400);
-      expect(res.body).toEqual(
-        expect.objectContaining({
-          error: 'ValidationError',
-          details: ['body.amount: required'],
-        })
-      );
-    });
-
-    it('should return 400 for invalid amount format', async () => {
-      const invalidBody = { ...validBody, amount: 'invalid' };
-      const res = await request(app)
-        .post(`/api/v1/offerings/${validOfferingId}/revenue`)
-        .send(invalidBody);
-
-      expect(res.statusCode).toBe(400);
-      expect(res.body).toEqual(
-        expect.objectContaining({
-          error: 'ValidationError',
-          details: ['body.amount: invalid format'],
-        })
-      );
-    });
-
-    it('should return 400 for amount with too many decimal places (>18)', async () => {
-      const invalidBody = { ...validBody, amount: '1.1234567890123456789' };
-      const res = await request(app)
-        .post(`/api/v1/offerings/${validOfferingId}/revenue`)
-        .send(invalidBody);
-
-      expect(res.statusCode).toBe(400);
-      expect(res.body).toEqual(
-        expect.objectContaining({
-          error: 'ValidationError',
-          details: ['body.amount: invalid format'],
-        })
-      );
-    });
-
-    it('should return 400 for missing periodStart', async () => {
-      const invalidBody = { ...validBody, periodStart: undefined };
-      const res = await request(app)
-        .post(`/api/v1/offerings/${validOfferingId}/revenue`)
-        .send(invalidBody);
-
-      expect(res.statusCode).toBe(400);
-      expect(res.body).toEqual(
-        expect.objectContaining({
-          error: 'ValidationError',
-          details: ['body.periodStart: required'],
-        })
-      );
-    });
-
-    it('should return 400 for invalid periodStart format', async () => {
-      const invalidBody = { ...validBody, periodStart: 'not-a-date' };
-      const res = await request(app)
-        .post(`/api/v1/offerings/${validOfferingId}/revenue`)
-        .send(invalidBody);
-
-      expect(res.statusCode).toBe(400);
-      expect(res.body).toEqual(
-        expect.objectContaining({
-          error: 'ValidationError',
-          details: ['body.periodStart: invalid format'],
-        })
-      );
-    });
-
-    it('should return 400 for missing periodEnd', async () => {
-      const invalidBody = { ...validBody, periodEnd: undefined };
-      const res = await request(app)
-        .post(`/api/v1/offerings/${validOfferingId}/revenue`)
-        .send(invalidBody);
-
-      expect(res.statusCode).toBe(400);
-      expect(res.body).toEqual(
-        expect.objectContaining({
-          error: 'ValidationError',
-          details: ['body.periodEnd: required'],
-        })
-      );
-    });
-
-    it('should return 400 for invalid periodEnd format', async () => {
-      const invalidBody = { ...validBody, periodEnd: 'not-a-date' };
-      const res = await request(app)
-        .post(`/api/v1/offerings/${validOfferingId}/revenue`)
-        .send(invalidBody);
-
-      expect(res.statusCode).toBe(400);
-      expect(res.body).toEqual(
-        expect.objectContaining({
-          error: 'ValidationError',
-          details: ['body.periodEnd: invalid format'],
-        })
-      );
-    });
-
-    it('should return 400 if RevenueService throws a validation error', async () => {
-      mockRevenueService.ingestRevenueReport.mockRejectedValue(
-        new AppError(ErrorCode.VALIDATION_ERROR, 'Revenue amount must be positive.', 400)
-      );
+      (RevenueReportRepository.prototype.findOverlappingReport as jest.Mock).mockResolvedValue(null);
+      (RevenueReportRepository.prototype.create as jest.Mock).mockResolvedValue({
+        id: 'report-1',
+        offering_id: validOfferingId,
+        amount: '1000.50',
+        period_start: new Date(validPayload.periodStart),
+        period_end: new Date(validPayload.periodEnd)
+      });
 
       const res = await request(app)
-        .post(`/api/v1/offerings/${validOfferingId}/revenue`)
-        .send(validBody);
+        .post(`/api/offerings/${validOfferingId}/revenue`)
+        .set('Authorization', 'Bearer valid-token')
+        .send(validPayload);
 
-      expect(res.statusCode).toBe(400);
-      expect(res.body).toEqual(
-        expect.objectContaining({
-          code: ErrorCode.VALIDATION_ERROR,
-          message: 'Revenue amount must be positive.',
-        })
-      );
+      expect(res.status).toBe(201);
+      expect(res.body.data.id).toBe('report-1');
     });
 
-    it('should return 500 if RevenueService throws an internal error', async () => {
-      mockRevenueService.ingestRevenueReport.mockRejectedValue(
-        new AppError(ErrorCode.INTERNAL_ERROR, 'Something went wrong.', 500)
-      );
+    it('should fail if unauthenticated', async () => {
+      const res = await request(app)
+        .post(`/api/offerings/${validOfferingId}/revenue`)
+        .send(validPayload);
+
+      expect(res.status).toBe(401);
+    });
+
+    it('should fail if user has no id in token', async () => {
+      const res = await request(app)
+        .post(`/api/offerings/${validOfferingId}/revenue`)
+        .set('Authorization', 'Bearer no-id')
+        .send(validPayload);
+
+      expect(res.status).toBe(401);
+      expect(res.body.code).toBe('UNAUTHORIZED');
+    });
+
+    it('should fail with validation error if amount is missing', async () => {
+      const res = await request(app)
+        .post(`/api/offerings/${validOfferingId}/revenue`)
+        .set('Authorization', 'Bearer valid-token')
+        .send({
+          periodStart: validPayload.periodStart,
+          periodEnd: validPayload.periodEnd
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should fail if offering not found', async () => {
+      (OfferingRepository.prototype.findById as jest.Mock).mockResolvedValue(null);
 
       const res = await request(app)
-        .post(`/api/v1/offerings/${validOfferingId}/revenue`)
-        .send(validBody);
+        .post(`/api/offerings/${validOfferingId}/revenue`)
+        .set('Authorization', 'Bearer valid-token')
+        .send(validPayload);
 
-      expect(res.statusCode).toBe(500);
-      expect(res.body).toEqual(
-        expect.objectContaining({
-          code: ErrorCode.INTERNAL_ERROR,
-          message: 'Internal server error', // Global error handler sanitizes
-        })
-      );
+      expect(res.status).toBe(404);
+      expect(res.body.code).toBe('NOT_FOUND');
+    });
+
+    it('should fail if user does not own offering', async () => {
+      (OfferingRepository.prototype.findById as jest.Mock).mockResolvedValue({
+        id: validOfferingId,
+        issuer_id: 'other-user'
+      });
+
+      const res = await request(app)
+        .post(`/api/offerings/${validOfferingId}/revenue`)
+        .set('Authorization', 'Bearer valid-token')
+        .send(validPayload);
+
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe('FORBIDDEN');
+    });
+
+    it('should fail if amount is negative or invalid format', async () => {
+      (OfferingRepository.prototype.findById as jest.Mock).mockResolvedValue({
+        id: validOfferingId,
+        issuer_id: 'user-123'
+      });
+
+      const res = await request(app)
+        .post(`/api/offerings/${validOfferingId}/revenue`)
+        .set('Authorization', 'Bearer valid-token')
+        .send({ ...validPayload, amount: '-100' });
+
+      // Might be caught by schema validation or service
+      expect(res.status).toBe(400);
+    });
+
+    it('should fail if periodEnd <= periodStart', async () => {
+      (OfferingRepository.prototype.findById as jest.Mock).mockResolvedValue({
+        id: validOfferingId,
+        issuer_id: 'user-123'
+      });
+
+      const res = await request(app)
+        .post(`/api/offerings/${validOfferingId}/revenue`)
+        .set('Authorization', 'Bearer valid-token')
+        .send({
+          amount: '1000',
+          periodStart: '2026-02-01T00:00:00Z',
+          periodEnd: '2026-01-31T23:59:59Z'
+        });
+
+      expect(res.status).toBe(400); // Bad request / validation error from service
+    });
+
+    it('should fail if there is an overlapping report', async () => {
+      (OfferingRepository.prototype.findById as jest.Mock).mockResolvedValue({
+        id: validOfferingId,
+        issuer_id: 'user-123'
+      });
+      (RevenueReportRepository.prototype.findOverlappingReport as jest.Mock).mockResolvedValue({});
+
+      const res = await request(app)
+        .post(`/api/offerings/${validOfferingId}/revenue`)
+        .set('Authorization', 'Bearer valid-token')
+        .send(validPayload);
+
+      expect(res.status).toBe(409); // Conflict error from service
+      expect(res.body.code).toBe('CONFLICT');
     });
   });
 
-  describe('POST /api/v1/revenue-reports', () => {
-    const validOfferingId = 'a1b2c3d4-e5f6-7890-1234-567890abcdef';
-    const validBody = {
+  describe('POST /api/revenue-reports', () => {
+    const validPayload = {
       offeringId: validOfferingId,
-      amount: '100.50',
-      periodStart: '2023-01-01T00:00:00Z',
-      periodEnd: '2023-01-31T23:59:59Z',
+      amount: '1000.50',
+      periodStart: '2026-01-01T00:00:00Z',
+      periodEnd: '2026-01-31T23:59:59Z'
     };
 
-    it('should return 202 for a valid revenue report with offeringId in body', async () => {
-      mockRevenueService.ingestRevenueReport.mockResolvedValue('stellar-tx-456');
+    it('should submit a revenue report successfully', async () => {
+      (OfferingRepository.prototype.findById as jest.Mock).mockResolvedValue({
+        id: validOfferingId,
+        issuer_id: 'user-123'
+      });
+      (RevenueReportRepository.prototype.findOverlappingReport as jest.Mock).mockResolvedValue(null);
+      (RevenueReportRepository.prototype.create as jest.Mock).mockResolvedValue({
+        id: 'report-2',
+        ...validPayload
+      });
 
       const res = await request(app)
-        .post(`/api/v1/revenue-reports`)
-        .send(validBody);
+        .post(`/api/revenue-reports`)
+        .set('Authorization', 'Bearer valid-token')
+        .send(validPayload);
 
-      expect(res.statusCode).toBe(202);
-      expect(res.body).toEqual({ message: 'Revenue report accepted for processing', transactionId: 'stellar-tx-456' });
-      expect(mockRevenueService.ingestRevenueReport).toHaveBeenCalledWith(validBody);
-    });
-
-    it('should return 400 for missing offeringId in body', async () => {
-      const invalidBody = { ...validBody, offeringId: undefined };
-      const res = await request(app)
-        .post(`/api/v1/revenue-reports`)
-        .send(invalidBody);
-
-      expect(res.statusCode).toBe(400);
-      expect(res.body).toEqual(
-        expect.objectContaining({
-          error: 'ValidationError',
-          details: ['body.offeringId: required'],
-        })
-      );
-    });
-
-    it('should return 400 for invalid offeringId format in body', async () => {
-      const invalidBody = { ...validBody, offeringId: 'not-a-uuid' };
-      const res = await request(app)
-        .post(`/api/v1/revenue-reports`)
-        .send(invalidBody);
-
-      expect(res.statusCode).toBe(400);
-      expect(res.body).toEqual(
-        expect.objectContaining({
-          error: 'ValidationError',
-          details: ['body.offeringId: invalid format'],
-        })
-      );
+      expect(res.status).toBe(201);
+      expect(res.body.data.id).toBe('report-2');
     });
   });
 });

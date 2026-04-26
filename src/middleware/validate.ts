@@ -1,10 +1,5 @@
 import { Request, Response, NextFunction, RequestHandler } from 'express';
-/**
- * @fileoverview Generic validation middleware for Express routes.
- * This module provides `validateParams` and `validateBody` functions to validate
- * request parameters and body against defined schemas using regular expressions
- * and basic type checks.
- */
+import { Errors } from '../lib/errors';
 
 type PrimitiveType = 'string' | 'number' | 'boolean';
 import { Request, Response, NextFunction } from 'express';
@@ -134,8 +129,7 @@ function makeMiddleware(
     const data = pick(req);
     const result = validateObject(data, schema, locationName);
     if (!result.valid) {
-      res.status(400).json({ error: 'ValidationError', details: result.errors });
-      return;
+      return next(Errors.validationError('Invalid request parameters', result.errors));
     }
     next();
   };
