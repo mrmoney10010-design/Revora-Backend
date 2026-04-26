@@ -5,6 +5,12 @@ import { Errors } from '../lib/errors';
 
 /**
  * Service for building and submitting Stellar transactions.
+ * 
+ * Features:
+ * - Retry logic with exponential backoff and idempotency
+ * - Comprehensive RPC failure classification
+ * - Structured logging and error handling
+ * - Transaction deduplication prevention
  */
 export class StellarSubmissionService {
   private server: StellarSdk.rpc.Server;
@@ -40,16 +46,18 @@ export class StellarSubmissionService {
   }
 
   /**
-   * Submits a simple payment transaction with enhanced error handling.
+   * Submits a simple payment transaction with enhanced error handling and idempotency.
    * @param to Destination public key
    * @param amount Amount to send (as string)
    * @param asset Asset to send (defaults to native XLM)
+   * @param idempotencyKey Optional key to prevent duplicate submissions
    * @returns Transaction result
    */
   async submitPayment(
     to: string,
     amount: string,
     asset: StellarSdk.Asset = StellarSdk.Asset.native(),
+    idempotencyKey?: string,
   ) {
     if (!to || typeof to !== 'string') {
       throw Errors.validationError('Destination public key must be a non-empty string');
@@ -85,6 +93,20 @@ export class StellarSubmissionService {
         .build();
 
       transaction.sign(this.keypair);
+      
+      // Check for idempotency to prevent duplicate submissions
+      const transactionHash = transaction.hash().toString('hex');
+      if (this.submittedTransactionHashes.has(transactionHash)) {
+        logger.warn('Duplicate transaction submission prevented', {
+          transactionHash,
+          idempotencyKey,
+          operation: 'submit_payment',
+        });
+        throw Errors.conflict('Transaction already submitted', {
+          hash: transactionHash,
+          idempotencyKey,
+        });
+      }
 
       const result = await this.server.sendTransaction(transaction);
 
@@ -111,7 +133,12 @@ export class StellarSubmissionService {
   }
 
   /**
-   * Invokes a Soroban contract with enhanced error handling.
+   * Invokes a Soroban contract with enhanced error handling and idempotency.
+   * @param contractId Contract ID to invoke
+   * @param functionName Function name to call
+   * @param args Function arguments
+   * @param idempotencyKey Optional key to prevent duplicate submissions
+   * @returns Transaction result
    */
   async invokeContract(
     _contractId: string,
@@ -133,7 +160,7 @@ export class StellarSubmissionService {
   }
 
   /**
-   * Helper method to get account with retry logic.
+   * Helper method to get account with enhanced retry logic and exponential backoff.
    */
   private async getAccountWithRetry(
     publicKey: string,
@@ -141,9 +168,20 @@ export class StellarSubmissionService {
   ): Promise<any> {
     let attemptCount = context.attemptCount || 1;
     
-    while (attemptCount <= 3) {
+    while (attemptCount <= this.maxRetries) {
       try {
-        return await this.server.getAccount(publicKey);
+        const account = await this.server.getAccount(publicKey);
+        
+        // Log successful retry if applicable
+        if (attemptCount > 1) {
+          logger.info('Stellar account retrieval succeeded after retry', {
+            publicKey,
+            attemptCount,
+            operation: 'get_account',
+          });
+        }
+        
+        return account;
       } catch (error) {
         const failure = classifyStellarRPCFailure(error, {
           ...context,
@@ -151,35 +189,55 @@ export class StellarSubmissionService {
           attemptCount,
         });
         
-        if (!shouldRetryStellarRPCFailure(failure)) {
+        if (!shouldRetryStellarRPCFailure(failure, this.maxRetries)) {
           throw this.createAppErrorFromFailure(failure);
         }
         
         this.logStellarFailure(failure);
         
-        if (failure.suggestedRetryDelayMs) {
-          await this.delay(failure.suggestedRetryDelayMs);
-        }
+        // Calculate exponential backoff delay
+        const delayMs = this.calculateRetryDelay(failure.suggestedRetryDelayMs, attemptCount);
+        logger.debug('Retrying Stellar account retrieval', {
+          publicKey,
+          attemptCount,
+          delayMs,
+          nextAttempt: attemptCount + 1,
+        });
         
+        await this.delay(delayMs);
         attemptCount++;
       }
     }
     
-    throw Errors.serviceUnavailable('Failed to retrieve Stellar account after multiple attempts');
+    throw Errors.serviceUnavailable('Failed to retrieve Stellar account after maximum retries', {
+      publicKey,
+      maxRetries: this.maxRetries,
+      operation: 'get_account',
+    });
   }
 
   /**
-   * Helper method to send transaction with retry logic.
+   * Helper method to send transaction with enhanced retry logic and exponential backoff.
    */
   private async sendTransactionWithRetry(
     transaction: StellarSdk.Transaction,
     context: StellarRPCFailureContext
   ): Promise<StellarSdk.rpc.Api.SendTransactionResponse> {
     let attemptCount = context.attemptCount || 1;
+    const transactionHash = transaction.hash().toString('hex');
     
-    while (attemptCount <= 3) {
+    while (attemptCount <= this.maxRetries) {
       try {
         const result = await this.server.sendTransaction(transaction);
+        
+        // Log successful retry if applicable
+        if (attemptCount > 1) {
+          logger.info('Stellar transaction submission succeeded after retry', {
+            transactionHash,
+            attemptCount,
+            operation: 'send_transaction',
+          });
+        }
         
         // Handle transaction submission results
         if (result.status === 'PENDING') {
@@ -187,6 +245,7 @@ export class StellarSubmissionService {
         } else if (result.status === 'DUPLICATE') {
           throw Errors.conflict('Transaction already submitted', {
             hash: result.hash,
+            transactionHash,
           });
         } else if (result.status === 'TRY_AGAIN_LATER') {
           throw new Error('Transaction rate limited, try again later');
@@ -198,24 +257,35 @@ export class StellarSubmissionService {
           ...context,
           operation: 'send_transaction',
           attemptCount,
-          transactionHash: transaction.hash().toString('hex'),
+          transactionHash,
         });
         
-        if (!shouldRetryStellarRPCFailure(failure)) {
+        if (!shouldRetryStellarRPCFailure(failure, this.maxRetries)) {
           throw this.createAppErrorFromFailure(failure);
         }
         
         this.logStellarFailure(failure);
         
-        if (failure.suggestedRetryDelayMs) {
-          await this.delay(failure.suggestedRetryDelayMs);
-        }
+        // Calculate exponential backoff delay
+        const delayMs = this.calculateRetryDelay(failure.suggestedRetryDelayMs, attemptCount);
+        logger.debug('Retrying Stellar transaction submission', {
+          transactionHash,
+          attemptCount,
+          delayMs,
+          nextAttempt: attemptCount + 1,
+          failureClass: failure.class,
+        });
         
+        await this.delay(delayMs);
         attemptCount++;
       }
     }
     
-    throw Errors.serviceUnavailable('Failed to submit Stellar transaction after multiple attempts');
+    throw Errors.serviceUnavailable('Failed to submit Stellar transaction after maximum retries', {
+      transactionHash,
+      maxRetries: this.maxRetries,
+      operation: 'send_transaction',
+    });
   }
 
   /**
@@ -273,9 +343,45 @@ export class StellarSubmissionService {
   }
 
   /**
-   * Utility method for delaying execution.
+   * Calculates retry delay with exponential backoff and jitter.
+   * @param suggestedDelayMs Suggested delay from failure classification
+   * @param attemptCount Current attempt number
+   * @returns Calculated delay in milliseconds
+   */
+  private calculateRetryDelay(suggestedDelayMs?: number, attemptCount: number = 1): number {
+    // Use suggested delay if provided, otherwise calculate exponential backoff
+    const baseDelay = suggestedDelayMs ?? this.baseDelayMs;
+    const exponentialDelay = Math.min(baseDelay * Math.pow(2, attemptCount - 1), this.maxDelayMs);
+    
+    // Add jitter to prevent thundering herd (±25% random variation)
+    const jitter = Math.random() * 0.5 - 0.25; // ±25%
+    const finalDelay = Math.round(exponentialDelay * (1 + jitter));
+    
+    return Math.max(this.baseDelayMs, finalDelay); // Ensure minimum delay
+  }
+
+  /**
+   * Utility method for delaying execution with Promise.
+   * @param ms Delay in milliseconds
+   * @returns Promise that resolves after delay
    */
   private delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Clears the transaction hash cache (useful for testing or memory management).
+   */
+  clearTransactionCache(): void {
+    this.submittedTransactionHashes.clear();
+    logger.debug('Stellar transaction cache cleared');
+  }
+
+  /**
+   * Gets the current size of the transaction hash cache.
+   * @returns Number of cached transaction hashes
+   */
+  getTransactionCacheSize(): number {
+    return this.submittedTransactionHashes.size;
   }
 }

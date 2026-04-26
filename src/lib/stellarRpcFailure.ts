@@ -140,14 +140,16 @@ export function classifyStellarRPCFailure(
     if (typeof status === 'number' && status >= 500) return StellarRPCFailureClass.UPSTREAM_ERROR;
   }
 
-  // Stellar-specific transaction errors
+  // Stellar-specific transaction errors with enhanced detection
   if (typeof error === 'object' && error !== null) {
     const errObj = error as any;
     
-    // Soroban contract errors
+    // Soroban contract errors with better detection
     if (errObj.code === 'CONTRACT_ERROR' || 
         errObj.message?.toLowerCase().includes('contract') ||
-        errObj.result_xdr?.includes('contract')) {
+        errObj.result_xdr?.includes('contract') ||
+        errObj.error?.includes('contract') ||
+        errObj.details?.includes('contract')) {
       return {
         class: StellarRPCFailureClass.CONTRACT_ERROR,
         context,
@@ -157,10 +159,13 @@ export function classifyStellarRPCFailure(
       };
     }
     
-    // Transaction failure codes
+    // Transaction failure codes with comprehensive detection
     if (errObj.code === 'TRANSACTION_FAILED' ||
         errObj.result_xdr?.includes('tx_failed') ||
-        errObj.message?.toLowerCase().includes('transaction failed')) {
+        errObj.message?.toLowerCase().includes('transaction failed') ||
+        errObj.message?.toLowerCase().includes('tx_failed') ||
+        errObj.status === 'ERROR' ||
+        errObj.result?.operation_results?.some((result: any) => result.tr?.type === 'tx_failed')) {
       return {
         class: StellarRPCFailureClass.TRANSACTION_FAILED,
         context,
@@ -170,10 +175,12 @@ export function classifyStellarRPCFailure(
       };
     }
     
-    // Insufficient funds
+    // Insufficient funds with enhanced detection
     if (errObj.code === 'INSUFFICIENT_FUNDS' ||
         errObj.message?.toLowerCase().includes('insufficient') ||
-        errObj.result_xdr?.includes('insufficient')) {
+        errObj.result_xdr?.includes('insufficient') ||
+        errObj.message?.toLowerCase().includes('no trustline') ||
+        errObj.message?.toLowerCase().includes('underfunded')) {
       return {
         class: StellarRPCFailureClass.INSUFFICIENT_FUNDS,
         context,
@@ -183,10 +190,12 @@ export function classifyStellarRPCFailure(
       };
     }
     
-    // Bad sequence number
+    // Bad sequence number with enhanced detection
     if (errObj.code === 'BAD_SEQUENCE' ||
         errObj.message?.toLowerCase().includes('sequence') ||
-        errObj.result_xdr?.includes('bad_seq')) {
+        errObj.result_xdr?.includes('bad_seq') ||
+        errObj.message?.toLowerCase().includes('bad sequence') ||
+        errObj.message?.toLowerCase().includes('sequence number')) {
       return {
         class: StellarRPCFailureClass.BAD_SEQUENCE,
         context,
@@ -197,10 +206,12 @@ export function classifyStellarRPCFailure(
       };
     }
     
-    // Signing errors
+    // Signing errors with enhanced detection
     if (errObj.code === 'SIGNING_ERROR' ||
         errObj.message?.toLowerCase().includes('signature') ||
-        errObj.message?.toLowerCase().includes('signing')) {
+        errObj.message?.toLowerCase().includes('signing') ||
+        errObj.message?.toLowerCase().includes('invalid signature') ||
+        errObj.message?.toLowerCase().includes('signature verification failed')) {
       return {
         class: StellarRPCFailureClass.SIGNING_ERROR,
         context,
@@ -223,14 +234,15 @@ export function classifyStellarRPCFailure(
     };
   }
 
-  // Default unknown error
+  // Default unknown error with enhanced retry logic
+  const isRetryable = context.attemptCount === undefined || context.attemptCount < 3;
   return {
     class: StellarRPCFailureClass.UNKNOWN,
     context,
     originalError: sanitizeError(error),
     timestamp,
-    shouldRetry: context.attemptCount === undefined || context.attemptCount < 3,
-    suggestedRetryDelayMs: 5000,
+    shouldRetry: isRetryable,
+    suggestedRetryDelayMs: Math.min(5000 * Math.pow(2, (context.attemptCount || 1) - 1), 30000),
   };
 }
 
@@ -283,12 +295,35 @@ function extractRetryAfter(error: any): number | undefined {
 
 /**
  * @dev Determines if a Stellar RPC failure should be retried based on classification and attempt count.
+ * Enhanced with better logic for different failure types and edge cases.
  */
 export function shouldRetryStellarRPCFailure(
   failure: StellarRPCFailure,
   maxAttempts: number = 3
 ): boolean {
-  return failure.shouldRetry && (failure.context.attemptCount || 1) < maxAttempts;
+  const currentAttempt = failure.context.attemptCount || 1;
+  
+  // Don't retry if we've exceeded max attempts
+  if (currentAttempt >= maxAttempts) {
+    return false;
+  }
+  
+  // Don't retry certain failure classes that are inherently non-retryable
+  const nonRetryableClasses = new Set([
+    StellarRPCFailureClass.VALIDATION_ERROR,
+    StellarRPCFailureClass.UNAUTHORIZED,
+    StellarRPCFailureClass.INSUFFICIENT_FUNDS,
+    StellarRPCFailureClass.TRANSACTION_FAILED,
+    StellarRPCFailureClass.CONTRACT_ERROR,
+    StellarRPCFailureClass.SIGNING_ERROR,
+  ]);
+  
+  if (nonRetryableClasses.has(failure.class)) {
+    return false;
+  }
+  
+  // Use the failure's shouldRetry flag as the primary indicator
+  return failure.shouldRetry;
 }
 
 /**
