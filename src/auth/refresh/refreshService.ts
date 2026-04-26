@@ -8,7 +8,42 @@ import {
     TokenService,
 } from './types';
 
+/**
+ * @module auth/refresh/RefreshService
+ * @description
+ * Stateless-safe refresh token rotation with reuse detection and concurrent
+ * request deduplication.
+ *
+ * Security assumptions:
+ *  - Each refresh token is single-use; using it a second time (even before the
+ *    first response is returned) triggers full revocation of the session tree.
+ *  - `findSessionByParentId` is the reuse-detection probe: if a child session
+ *    already exists, the parent token has been consumed.
+ *  - A concurrent double-use (two simultaneous calls with the same token) is
+ *    handled by an in-flight `Set` keyed on `sessionId`.  The second concurrent
+ *    caller is treated identically to a reuse attempt: the session tree is
+ *    revoked and `null` is returned.
+ *  - The in-flight lock is always released via `finally`; a DB crash cannot
+ *    leave a session permanently locked.
+ *  - `revokeSessionAndDescendants` is idempotent — safe to call multiple times.
+ *
+ * Abuse / failure paths:
+ *  - Invalid / expired refresh token    → null  (no revocation)
+ *  - Session not found                  → null
+ *  - Session already revoked            → null + revokeSessionAndDescendants
+ *  - Token already used (child present) → null + revokeSessionAndDescendants
+ *  - Concurrent double-use              → null + revokeSessionAndDescendants
+ */
 export class RefreshService {
+    /**
+     * Tracks session IDs that are currently mid-refresh.
+     * Prevents two concurrent calls from both succeeding with the same token.
+     *
+     * @dev The set holds string sessionIds.  It is cleared in a `finally` block
+     *      so it cannot grow unbounded even under error conditions.
+     */
+    private readonly inFlightSessions = new Set<string>();
+
     constructor(
         private readonly repository: RefreshTokenRepository,
         private readonly tokenService: TokenService,
