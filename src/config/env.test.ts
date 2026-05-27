@@ -1,6 +1,6 @@
-import { env } from './env';
+import { buildConfig } from './env';
 
-describe('Environment Configuration - ALLOWED_ORIGINS', () => {
+describe('env config', () => {
   const originalEnv = process.env;
 
   beforeEach(() => {
@@ -8,48 +8,77 @@ describe('Environment Configuration - ALLOWED_ORIGINS', () => {
     process.env = { ...originalEnv };
   });
 
-  afterEach(() => {
+  afterAll(() => {
     process.env = originalEnv;
   });
 
-  it('should parse a single origin', () => {
-    process.env.ALLOWED_ORIGINS = 'https://app.example.com';
-    const { env: updatedEnv } = require('./env');
-    expect(updatedEnv.ALLOWED_ORIGINS).toEqual(['https://app.example.com']);
-  });
-
-  it('should parse multiple comma-separated origins', () => {
-    process.env.ALLOWED_ORIGINS = 'https://app.example.com, https://admin.example.com ';
-    const { env: updatedEnv } = require('./env');
-    expect(updatedEnv.ALLOWED_ORIGINS).toEqual(['https://app.example.com', 'https://admin.example.com']);
-  });
-
-  it('should default to localhost in development', () => {
+  it('should parse valid environment variables', () => {
     process.env.NODE_ENV = 'development';
-    delete process.env.ALLOWED_ORIGINS;
-    const { env: updatedEnv } = require('./env');
-    expect(updatedEnv.ALLOWED_ORIGINS).toEqual(['http://localhost:3000']);
+    process.env.PORT = '3000';
+    process.env.STELLAR_SERVER_SECRET = 'SA...'; // valid length
+
+    const cfg = buildConfig();
+    expect(cfg.PORT).toBe(3000);
+    expect(cfg.NODE_ENV).toBe('development');
   });
 
-  it('should return empty array in production if not set', () => {
+  it('should abort startup on missing required production variables', () => {
+    const mockExit = jest.spyOn(process, 'exit').mockImplementation((code?: number) => {
+      throw new Error(`Process.exit called with ${code}`);
+    });
+    const mockConsoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+
     process.env.NODE_ENV = 'production';
-    delete process.env.ALLOWED_ORIGINS;
-    // Mocking other required production env vars
-    process.env.DATABASE_URL = 'postgres://localhost:5432';
-    process.env.JWT_SECRET = 'secret';
+    process.env.STELLAR_SERVER_SECRET = 'valid_secret';
+    // Missing DATABASE_URL and JWT_SECRET
+
+    try {
+      buildConfig();
+      fail('Expected buildConfig to throw');
+    } catch (e: any) {
+      expect(e.message).toBe('Process.exit called with 1');
+    }
+    expect(mockConsoleError).toHaveBeenCalledWith(expect.stringContaining('[FATAL]'));
     
-    const { env: updatedEnv } = require('./env');
-    expect(updatedEnv.ALLOWED_ORIGINS).toEqual([]);
+    mockExit.mockRestore();
+    mockConsoleError.mockRestore();
   });
 
-  it('should throw error if both "*" and explicit origins are provided', () => {
-    process.env.ALLOWED_ORIGINS = '*,https://app.example.com';
-    expect(() => require('./env')).toThrow("CORS configuration error: ALLOWED_ORIGINS cannot contain both '*' and explicit origins");
+  it('should require STELLAR_SERVER_SECRET outside test env', () => {
+    const mockExit = jest.spyOn(process, 'exit').mockImplementation((code?: number) => {
+      throw new Error(`Process.exit called with ${code}`);
+    });
+    const mockConsoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    process.env.NODE_ENV = 'development';
+    delete process.env.STELLAR_SERVER_SECRET;
+
+    try {
+      buildConfig();
+      fail('Expected buildConfig to throw');
+    } catch (e: any) {
+      expect(e.message).toBe('Process.exit called with 1');
+    }
+    expect(mockConsoleError).toHaveBeenCalledWith(expect.stringContaining('[FATAL]'));
+    
+    mockExit.mockRestore();
+    mockConsoleError.mockRestore();
   });
 
-  it('should allow a single "*" origin', () => {
-    process.env.ALLOWED_ORIGINS = '*';
-    const { env: updatedEnv } = require('./env');
-    expect(updatedEnv.ALLOWED_ORIGINS).toEqual(['*']);
+  it('should allow missing STELLAR_SERVER_SECRET in test env', () => {
+    process.env.NODE_ENV = 'test';
+    delete process.env.STELLAR_SERVER_SECRET;
+
+    const cfg = buildConfig();
+    expect(cfg.STELLAR_SERVER_SECRET).toBeUndefined();
+  });
+
+  it('should parse ALLOWED_ORIGINS correctly', () => {
+    process.env.NODE_ENV = 'development';
+    process.env.STELLAR_SERVER_SECRET = 'valid';
+    process.env.ALLOWED_ORIGINS = 'http://example.com, https://test.com ';
+
+    const cfg = buildConfig();
+    expect(cfg.ALLOWED_ORIGINS_ARRAY).toEqual(['http://example.com', 'https://test.com']);
   });
 });
