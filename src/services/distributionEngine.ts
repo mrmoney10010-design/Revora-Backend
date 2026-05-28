@@ -1,6 +1,8 @@
 import { Logger, globalLogger } from '../lib/logger';
 import { Errors } from '../lib/errors';
 import { Decimal } from '../lib/decimal';
+import { Pool } from 'pg';
+import { withTransaction } from '../db/transaction';
 import { 
   classifyStellarRPCFailure, 
   StellarRPCFailureClass,
@@ -9,155 +11,127 @@ import {
 } from '../lib/stellarRpcFailure';
 
 /**
- * @title DistributionEngine
- * @notice Computes per-investor payout amounts based on token balances and persists them.
- * @dev This service handles the core logic for revenue distribution, including:
- * 1. Balance acquisition (via provider or repository)
- * 2. Decimal-based proration of revenue based on balances (exact-to-the-cent)
- * 3. Largest-share reconciliation adjustment to ensure total payout exactly equals revenue
- * 4. Persistence of distribution runs and individual payouts with a retry strategy
- * 5. Batch processing for large payout sets with partial failure handling
- * 
- * **Precision & Rounding:**
- * All financial calculations use the Decimal utility (src/lib/decimal.ts) which operates
- * on BigInt internally to eliminate IEEE 754 floating-point rounding errors. This ensures:
- * - Exact-to-the-cent payout calculations
- * - No penny-pinching or revenue leakage due to rounding
- * - Deterministic, reproducible results across all invocations
- * 
- * **Security Assumptions & Risk Notes:**
- * - **Trust Boundary**: Balance data is assumed to be validated by the provided `balanceProvider` or `offeringRepo`.
- * - **Idempotency**: Runs are keyed by `(offeringId, periodId, totalAmount)`. Multiple calls with same params will resume or return existing run.
- * - **Data Leakage**: Stellar RPC failures are classified via `classifyStellarRPCFailure` to ensure raw upstream error strings do not leak to client.
- * - **Transactionality**: Payouts are persisted individually within batches. Partial failures are recorded in the `distribution_run` status.
- * - **Rounding**: The "Largest-Share Adjustment" strategy is used to ensure total payouts exactly match `revenueAmount` to the cent, preventing minor leakage or shortfall.
- */
+    // 6. Process payouts in batches with optional transaction support
+    const existingPayouts = await this.distributionRepo.getPayoutsForRun(run.id);
+    const existingInvestorIds = new Set(existingPayouts.map((p: any) => p.investor_id));
 
-export interface BalanceRow {
-  investor_id: string;
-  balance: number; // numeric balance; precision handled by callers/tests
-}
+    const successfulPayouts: Array<{ investor_id: string; amount: string }> = existingPayouts.map((p: any) => ({
+      investor_id: p.investor_id,
+      amount: p.amount,
+    }));
+    const failedPayouts: Array<{ investor_id: string; amount: string; error: string; errorClass?: string }> = [];
+    let hasBatchFailure = false;
 
-export interface DistributionResult {
-  distributionRun: any;
-  payouts: Array<{ investor_id: string; amount: string }>;
-}
+    for (let batchStart = 0; batchStart < rounded.length; batchStart += this.batchSize) {
+      const batch = rounded.slice(batchStart, batchStart + this.batchSize);
+      const batchNumber = Math.floor(batchStart / this.batchSize) + 1;
 
-/** Enhanced result type with batch processing details */
-export interface DistributionBatchResult {
-  distributionRun: any;
-  successfulPayouts: Array<{ investor_id: string; amount: string }>;
-  failedPayouts: Array<{ investor_id: string; amount: string; error: string; errorClass?: string }>;
-  totalPayouts: number;
-}
+      try {
+        if (this.pool) {
+          // Transactional batch: create all payouts within a DB transaction
+          await withTransaction(this.pool, async (client) => {
+            for (const r of batch) {
+              if (existingInvestorIds.has(r.investor_id)) continue;
 
-export interface DistributionEngineOptions {
-  maxRetries?: number;
-  initialDelayMs?: number;
-  backoffFactor?: number;
-  /** Log retry attempts to console/logger */
-  logRetries?: boolean;
-  /** Max payouts per batch to prevent overwhelming the database (default: 50) */
-  batchSize?: number;
-}
+              const amtStr = r.amount.toString();
+              await this.withRetry(() =>
+                // Pass client for transactional repository implementations
+                this.distributionRepo.createPayout({
+                  distribution_run_id: run.id,
+                  investor_id: r.investor_id,
+                  amount: amtStr,
+                  status: 'pending',
+                }, client)
+              );
 
-export class DistributionEngine {
-  private readonly maxRetries: number;
-  private readonly initialDelayMs: number;
-  private readonly backoffFactor: number;
-  private readonly logRetries: boolean;
-  private readonly batchSize: number;
-  private readonly logger: Logger;
+              successfulPayouts.push({ investor_id: r.investor_id, amount: amtStr });
+              existingInvestorIds.add(r.investor_id);
+            }
+          });
+        } else {
+          // Non-transactional fallback for compatibility (used by tests/mocks)
+          for (const r of batch) {
+            if (existingInvestorIds.has(r.investor_id)) continue;
 
-  constructor(
-    private offeringRepo: any,
-    private distributionRepo: any,
-    private balanceProvider?: { getBalances: (offeringId: string, period: any) => Promise<BalanceRow[]> },
-    options: DistributionEngineOptions = {}
-  ) {
-    this.maxRetries = options.maxRetries ?? 3;
-    this.initialDelayMs = options.initialDelayMs ?? 500;
-    this.backoffFactor = options.backoffFactor ?? 2;
-    this.logRetries = options.logRetries ?? false;
-    this.batchSize = options.batchSize ?? 50;
-    this.logger = globalLogger;
-  }
+            const amtStr = r.amount.toString();
+            try {
+              await this.withRetry(() =>
+                this.distributionRepo.createPayout({
+                  distribution_run_id: run.id,
+                  investor_id: r.investor_id,
+                  amount: amtStr,
+                  status: 'pending',
+                })
+              );
+              successfulPayouts.push({ investor_id: r.investor_id, amount: amtStr });
+              existingInvestorIds.add(r.investor_id);
+            } catch (err) {
+              const failure = classifyStellarRPCFailure(err, {
+                operation: 'createPayout',
+                offeringId,
+                periodId: period.id,
+              });
 
-  /**
-   * @notice Distribute revenueAmount across investors for an offering and period.
-   * @dev Security Assumptions:
-   * - revenueAmount must be strictly positive.
-   * - offeringId must be valid and exist (checked by repo).
-   * - totalBalance must be > 0.
-   * - Payouts are persisted with a retry strategy to handle transient failures.
-   * - Batch processing prevents overwhelming the database with large payout sets.
-   *
-   * @param offeringId The unique identifier of the offering
-   * @param period The timeframe for which the distribution is being made
-   * @param revenueAmount The total amount of revenue to be distributed
-   * @returns The created distribution run and the list of payouts
-   */
-  async distribute(
-    offeringId: string,
-    period: { id: string; start: Date; end: Date },
-    revenueAmount: number
-  ): Promise<DistributionResult> {
-    const result = await this.distributeWithBatch(offeringId, period, revenueAmount);
-    
-    if (result.failedPayouts.length > 0) {
-      const firstFailure = result.failedPayouts[0];
-      const errorMsg = firstFailure.errorClass 
-        ? `Distribution failed: ${firstFailure.errorClass}`
-        : 'Distribution completed with partial failures';
-      throw Errors.internal(errorMsg);
+              this.logger.error('Payout creation failed', {
+                offeringId,
+                runId: run.id,
+                investorId: r.investor_id,
+                errorClass: failure.class,
+                batchNumber,
+                rawError: err instanceof Error ? err.message : String(err),
+              });
+
+              failedPayouts.push({
+                investor_id: r.investor_id,
+                amount: amtStr,
+                error: `Action failed with ${failure.class}`,
+                errorClass: failure.class,
+              });
+            }
+          }
+        }
+
+        this.logger.info('Distribution batch processed successfully', {
+          offeringId,
+          runId: run.id,
+          batchNumber,
+          payoutsInBatch: batch.length,
+          transactional: !!this.pool,
+        });
+      } catch (err) {
+        hasBatchFailure = true;
+        const failure = classifyStellarRPCFailure(err, {
+          operation: 'processBatch',
+          offeringId,
+          periodId: period.id,
+        });
+
+        this.logger.error('Payout batch failed', {
+          offeringId,
+          runId: run.id,
+          batchNumber,
+          errorClass: failure.class,
+          investorCount: batch.length,
+          transactional: !!this.pool,
+          rawError: err instanceof Error ? err.message : String(err),
+        });
+
+        // In non-transactional mode, record which specific payouts failed
+        if (!this.pool) {
+          for (const r of batch) {
+            if (!existingInvestorIds.has(r.investor_id) && !successfulPayouts.some(p => p.investor_id === r.investor_id)) {
+              const amtStr = r.amount.toString();
+              failedPayouts.push({
+                investor_id: r.investor_id,
+                amount: amtStr,
+                error: `Batch processing failed: ${failure.class}`,
+                errorClass: failure.class,
+              });
+            }
+          }
+        }
+      }
     }
-
-    // Backward compatibility: return original shape
-    return {
-      distributionRun: result.distributionRun,
-      payouts: result.successfulPayouts,
-    };
-  }
-
-  /**
-   * @notice Distribute revenueAmount with batch processing and partial failure tracking.
-   * @dev This is the enhanced version that returns detailed batch results.
-   * 
-   * **Decimal-Based Proration Algorithm:**
-   * This method uses exact-to-the-cent calculations via the Decimal utility to ensure
-   * financial accuracy. The algorithm works as follows:
-   *
-   * 1. **Precise Share Calculation**: Each investor's raw share is calculated as:
-   *    `share = (investor_balance / total_balance) * revenueAmount` using Decimal arithmetic.
-   *    This maintains up to 18 decimal places of precision internally.
-   *
-   * 2. **Rounding to Cents**: Each share is independently rounded to 2 decimal places
-   *    using the "round half up" strategy, producing an amount in cents.
-   *
-   * 3. **Reconciliation Adjustment** (Largest-Share Method):
-   *    - Calculate the sum of all rounded amounts.
-   *    - Compute the difference: `diff = revenueAmount - roundedSum`.
-   *    - If `diff != 0`, identify the investor with the largest raw share.
-   *    - Adjust that investor's payout by exactly `diff` to ensure the total equals revenueAmount.
-   *    - This approach prioritizes accuracy and prevents penny-pinching edge cases.
-   *
-   * **Why This Is Secure & Efficient:**
-   * - **No Floating-Point Errors**: Uses BigInt internally to eliminate IEEE 754 artifacts.
-   * - **Exact-to-the-Cent**: All calculations preserve exactly 2 decimal places.
-   * - **Deterministic**: The same inputs always produce identical payouts (idempotent).
-   * - **Transparent**: The largest-share recipient is implicitly "adjusted" for rounding, 
-   *   which is the investor who benefits most from the proration anyway.
-   *
-   * **Example**:
-   *   Investors: i1 (balance 100), i2 (balance 100), i3 (balance 100)
-   *   Revenue: $100.00
-   *   Shares: 33.333... each → rounded to 33.33, 33.33, 33.33
-   *   Sum: $99.99
-   *   Diff: $0.01 (goes to investor with largest raw share, which is a tie, so first is adjusted)
-   *   Final: 33.34, 33.33, 33.33 (or similar depending on rounding)
-   *
-   * @param offeringId The unique identifier of the offering
-   * @param period The timeframe for which the distribution is being made
    * @param revenueAmount The total amount of revenue to be distributed
    * @returns Batch result with successful and failed payouts
    */
@@ -378,7 +352,7 @@ export class DistributionEngine {
       batchSize: this.batchSize,
     });
 
-    // 6. Process payouts in batches with partial failure tracking
+    // 6. Process payouts in batches with atomic transaction support
     const existingPayouts = await this.distributionRepo.getPayoutsForRun(run.id);
     const existingInvestorIds = new Set(existingPayouts.map((p: any) => p.investor_id));
 
@@ -394,48 +368,91 @@ export class DistributionEngine {
       const batchNumber = Math.floor(batchStart / this.batchSize) + 1;
 
       try {
-        for (const r of batch) {
-          if (existingInvestorIds.has(r.investor_id)) {
-            continue;
-          }
+        // Process batch with transaction support if pool is available
+        if (this.pool) {
+          await withTransaction(this.pool, async (client) => {
+            for (const r of batch) {
+              if (existingInvestorIds.has(r.investor_id)) {
+                continue;
+              }
 
+<<<<<<< HEAD
           // Decimal with scale 2 toString() returns exactly 2 decimal places
           const amtStr = r.amount.toString();
           try {
             await this.withRetry(() =>
               this.distributionRepo.createPayout({
                 distribution_run_id: run.id,
+=======
+              const amtStr = r.amount.toFixed(2);
+              await this.withRetry(() =>
+                this.distributionRepo.createPayout(
+                  {
+                    distribution_id: run.id,
+                    investor_id: r.investor_id,
+                    amount: amtStr,
+                    status: 'pending',
+                  },
+                  client
+                )
+              );
+              successfulPayouts.push({ investor_id: r.investor_id, amount: amtStr });
+              existingInvestorIds.add(r.investor_id);
+            }
+          });
+        } else {
+          // Fallback to non-transactional processing for backward compatibility
+          for (const r of batch) {
+            if (existingInvestorIds.has(r.investor_id)) {
+              continue;
+            }
+
+            const amtStr = r.amount.toFixed(2);
+            try {
+              await this.withRetry(() =>
+                this.distributionRepo.createPayout({
+                  distribution_id: run.id,
+                  investor_id: r.investor_id,
+                  amount: amtStr,
+                  status: 'pending',
+                })
+              );
+              successfulPayouts.push({ investor_id: r.investor_id, amount: amtStr });
+              existingInvestorIds.add(r.investor_id);
+            } catch (err) {
+              const failure = classifyStellarRPCFailure(err, {
+                operation: 'createPayout',
+                offeringId,
+                periodId: period.id,
+              });
+              
+              this.logger.error('Payout creation failed', {
+                offeringId,
+                runId: run.id,
+                investorId: r.investor_id,
+                errorClass: failure.class,
+                batchNumber,
+                rawError: err instanceof Error ? err.message : String(err),
+              });
+
+              failedPayouts.push({
+>>>>>>> origin/master
                 investor_id: r.investor_id,
                 amount: amtStr,
-                status: 'pending',
-              })
-            );
-            successfulPayouts.push({ investor_id: r.investor_id, amount: amtStr });
-          } catch (err) {
-            const failure = classifyStellarRPCFailure(err, {
-              operation: 'createPayout',
-              offeringId,
-              periodId: period.id,
-            });
-            
-            this.logger.error('Payout creation failed', {
-              offeringId,
-              runId: run.id,
-              investorId: r.investor_id,
-              errorClass: failure.class,
-              batchNumber,
-              // Log raw error internally but don't expose it in the result
-              rawError: err instanceof Error ? err.message : String(err),
-            });
-
-            failedPayouts.push({
-              investor_id: r.investor_id,
-              amount: amtStr,
-              error: `Action failed with ${failure.class}`,
-              errorClass: failure.class,
-            });
+                error: `Action failed with ${failure.class}`,
+                errorClass: failure.class,
+              });
+            }
           }
         }
+
+        this.logger.info('Distribution batch processed successfully', {
+          offeringId,
+          runId: run.id,
+          batchNumber,
+          payoutsInBatch: batch.length,
+          transactional: !!this.pool,
+        });
       } catch (err) {
         hasBatchFailure = true;
         const failure = classifyStellarRPCFailure(err, {
@@ -443,13 +460,33 @@ export class DistributionEngine {
           offeringId,
           periodId: period.id,
         });
+
         this.logger.error('Payout batch failed', {
           offeringId,
           runId: run.id,
           batchNumber,
           errorClass: failure.class,
           investorCount: batch.length,
+          transactional: !!this.pool,
+          rawError: err instanceof Error ? err.message : String(err),
         });
+
+        // When a transactional batch fails, don't add individual failures 
+        // because the entire batch rolled back
+        if (!this.pool) {
+          // In non-transactional mode, any payout that wasn't already added to successfulPayouts failed
+          for (const r of batch) {
+            if (!existingInvestorIds.has(r.investor_id) && !successfulPayouts.some(p => p.investor_id === r.investor_id)) {
+              const amtStr = r.amount.toFixed(2);
+              failedPayouts.push({
+                investor_id: r.investor_id,
+                amount: amtStr,
+                error: `Batch processing failed: ${failure.class}`,
+                errorClass: failure.class,
+              });
+            }
+          }
+        }
       }
     }
 

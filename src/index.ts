@@ -10,10 +10,17 @@ import { classifyStellarRPCFailure, StellarRPCFailureClass } from './lib/stellar
 import { createHealthRouter } from './routes/health';
 import vestingRouter from './routes/vesting';
 import { offeringSanitizeMiddleware } from './middleware/offeringSanitize';
-import { createStartupAuthTierLimiter } from './middleware/startupAuthRateTierPolicy';
+import { createStartupRegisterRateLimit } from './middleware/startupRegisterRateLimit';
+import { env } from './config/env';
+import { validateWebhookUrl, SsrfValidationError } from './lib/ssrfProtection';
+import { WebhookEndpointRepository, WebhookDelivery } from './db/repositories/webhookEndpointRepository';
+import { WebhookService, WebhookPayload, WebhookEventType } from './services/webhookService';
+import { pool } from './db/pool';
+import { createPasswordResetRouter } from './routes/passwordReset';
+import { emailService } from './services/emailService';
 
-const port = process.env.PORT ?? 3000;
-const API_VERSION_PREFIX = process.env.API_VERSION_PREFIX ?? "/api/v1";
+const port = env.PORT;
+const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
 
 const OFFERING_ROLES = ["startup", "admin", "compliance", "investor"] as const;
 const OFFERING_ACTIONS = [
@@ -40,8 +47,6 @@ const OFFERING_SECURITY_ASSUMPTIONS = [
   "Startup actors may only manage offerings they issued unless a privileged admin or compliance actor performs the action.",
   "Validation output is safe for clients and never includes raw database, token, or upstream provider error messages.",
 ] as const;
-const STARTUP_REGISTER_LIMIT = 5;
-const STARTUP_REGISTER_WINDOW_MS = 15 * 60 * 1000;
 
 type OfferingActorRole = (typeof OFFERING_ROLES)[number];
 type OfferingValidationAction = (typeof OFFERING_ACTIONS)[number];
@@ -60,11 +65,6 @@ interface AuthenticatedRequest extends Request {
 interface AppDependencies {
   healthQuery?: typeof dbQuery;
   healthStatus?: typeof dbHealth;
-}
-
-interface StartupRegistrationAttemptState {
-  count: number;
-  resetAt: number;
 }
 
 interface OfferingValidationPayload {
@@ -183,53 +183,6 @@ function parseIsoDate(value: unknown): Date | null {
   }
 
   return parsed;
-}
-
-function createStartupRegisterLimiter(): RequestHandler {
-  const attempts = new Map<string, StartupRegistrationAttemptState>();
-
-  return (req: Request, res: Response, next: NextFunction): void => {
-    const now = Date.now();
-    const key = req.ip || req.socket.remoteAddress || "unknown";
-    const current = attempts.get(key);
-
-    if (!current || current.resetAt <= now) {
-      attempts.set(key, {
-        count: 1,
-        resetAt: now + STARTUP_REGISTER_WINDOW_MS,
-      });
-      res.setHeader("X-RateLimit-Limit", String(STARTUP_REGISTER_LIMIT));
-      res.setHeader(
-        "X-RateLimit-Remaining",
-        String(STARTUP_REGISTER_LIMIT - 1),
-      );
-      next();
-      return;
-    }
-
-    if (current.count >= STARTUP_REGISTER_LIMIT) {
-      const retryAfterSeconds = Math.max(
-        1,
-        Math.ceil((current.resetAt - now) / 1000),
-      );
-      res.setHeader("X-RateLimit-Limit", String(STARTUP_REGISTER_LIMIT));
-      res.setHeader("X-RateLimit-Remaining", "0");
-      res.setHeader("Retry-After", String(retryAfterSeconds));
-      res.status(429).json({
-        error: "TooManyRequests",
-        message: "Too many registration attempts",
-      });
-      return;
-    }
-
-    current.count += 1;
-    res.setHeader("X-RateLimit-Limit", String(STARTUP_REGISTER_LIMIT));
-    res.setHeader(
-      "X-RateLimit-Remaining",
-      String(Math.max(0, STARTUP_REGISTER_LIMIT - current.count)),
-    );
-    next();
-  };
 }
 
 function createStartupRegisterHandler(): RequestHandler {
@@ -600,7 +553,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   app.set("trust proxy", 1);
   app.use(createCorsMiddleware() as RequestHandler);
   app.use(express.json({ limit: "32kb" }));
-  app.use(morgan(process.env.NODE_ENV === "test" ? "tiny" : "dev"));
+  app.use(morgan(env.NODE_ENV === "test" ? "tiny" : "dev"));
 
   app.get("/health", async (_req: Request, res: Response) => {
     const db = await healthStatus();
@@ -624,7 +577,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
   apiRouter.post(
     "/startup/register",
-    createStartupAuthTierLimiter().middleware,
+    createStartupRegisterRateLimit(),
     createStartupRegisterHandler(),
   );
 
@@ -636,6 +589,9 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   );
 
   apiRouter.use('/vesting', vestingRouter);
+
+  // Mount password reset router
+  app.use(createPasswordResetRouter({ db: pool, emailService }));
 
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
@@ -673,18 +629,33 @@ export const setServer = (value: ReturnType<typeof app.listen>) => {
 
 /**
  * Webhook delivery queue with exponential backoff and SSRF-aware URL blocking.
+ * @notice Uses comprehensive SSRF protection including IPv6, link-local, and DNS rebinding prevention.
  */
 export class WebhookQueue {
+  private static repo: WebhookEndpointRepository;
+  private static service: WebhookService;
   private static MAX_RETRIES = 5;
   private static INITIAL_DELAY = 1000;
 
-  private static isSafeUrl(url: string): boolean {
-    const privateIPs = /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)/;
+  static init(repo: WebhookEndpointRepository, service: WebhookService) {
+    this.repo = repo;
+    this.service = service;
+  }
 
+  /**
+   * @notice Validates a webhook URL using comprehensive SSRF protection.
+   * @dev Enforces HTTPS, rejects private/reserved addresses (IPv4 and IPv6),
+   * resolves DNS to prevent rebinding attacks, and rejects embedded credentials.
+   */
+  private static async isSafeUrl(url: string): Promise<boolean> {
     try {
-      const { hostname } = new URL(url);
-      return !privateIPs.test(hostname) && hostname !== "localhost";
-    } catch {
+      const result = await validateWebhookUrl(url, true);
+      if (!result.valid) {
+        console.error(`[Security] SSRF validation failed for ${url}: ${result.error?.message}`);
+      }
+      return result.valid;
+    } catch (error) {
+      console.error(`[Security] Error validating webhook URL ${url}:`, error);
       return false;
     }
   }
@@ -699,41 +670,117 @@ export class WebhookQueue {
 
   static async processDelivery(
     url: string,
-    payload: object,
-    attempt = 0,
+    payload: any,
+    deliveryId?: string,
   ): Promise<boolean> {
-    void payload;
+    if (!this.repo || !this.service) {
+      console.error("[WebhookQueue] Not initialized");
+      return false;
+    }
 
-    if (!this.isSafeUrl(url)) {
+    if (!(await this.isSafeUrl(url))) {
       console.error(`[Security] Blocked unsafe webhook URL: ${url}`);
       return false;
     }
 
-    try {
-      throw new Error("Simulated Network Failure");
-    } catch {
-      const nextDelay = this.getBackoffDelay(attempt);
-      if (nextDelay !== -1) {
-        return new Promise((resolve) => {
-          setTimeout(() => {
-            void this.processDelivery(url, payload, attempt + 1).then(resolve);
-          }, nextDelay);
-        });
-      }
-
+    const endpoint = await this.repo.findByUrl(url);
+    if (!endpoint) {
+      console.error(`[WebhookQueue] No active endpoint found for URL: ${url}`);
       return false;
+    }
+
+    let delivery: WebhookDelivery | null = null;
+    if (deliveryId) {
+      delivery = await this.repo.findDeliveryById(deliveryId);
+    }
+
+    if (!delivery) {
+      delivery = await this.repo.createDelivery({
+        endpoint_id: endpoint.id,
+        payload,
+        status: 'pending',
+        attempts: 0
+      });
+    }
+
+    const currentAttempt = delivery.attempts + 1;
+    
+    // Construct WebhookPayload for real delivery
+    const webhookPayload: WebhookPayload = {
+      id: delivery.id,
+      event: (payload as any).event || WebhookEventType.OFFERING_UPDATED,
+      payload: (payload as any).payload || payload,
+      timestamp: new Date().toISOString(),
+    };
+
+    const result = await this.service.sendAttempt({
+      id: endpoint.id,
+      url: endpoint.url,
+      secret: endpoint.secret
+    }, webhookPayload);
+
+    if (result.success) {
+      await this.repo.updateDelivery(delivery.id, {
+        status: 'completed',
+        attempts: currentAttempt,
+        last_error: null,
+        next_retry_at: null
+      });
+      return true;
+    }
+
+    const isRetryable = !result.statusCode || (result.statusCode >= 500) || (result.statusCode === 429);
+    const nextDelay = this.getBackoffDelay(currentAttempt);
+
+    if (isRetryable && nextDelay !== -1) {
+      const nextRetryAt = new Date(Date.now() + nextDelay);
+      await this.repo.updateDelivery(delivery.id, {
+        attempts: currentAttempt,
+        last_error: result.error,
+        next_retry_at: nextRetryAt
+      });
+      
+      setTimeout(() => {
+        void this.processDelivery(url, payload, delivery!.id);
+      }, nextDelay);
+      
+      return false;
+    } else {
+      await this.repo.updateDelivery(delivery.id, {
+        status: nextDelay === -1 ? 'dead_letter' : 'failed',
+        attempts: currentAttempt,
+        last_error: result.error,
+        next_retry_at: null
+      });
+      return false;
+    }
+  }
+
+  static async resumePending(): Promise<void> {
+    if (!this.repo) return;
+    const pending = await this.repo.getPendingDeliveries();
+    for (const delivery of pending) {
+      const endpoint = await this.repo.findById(delivery.endpoint_id);
+      if (endpoint) {
+        void this.processDelivery(endpoint.url, delivery.payload, delivery.id);
+      }
     }
   }
 }
 
 /* istanbul ignore next -- bootstrapping is integration-environment specific */
-if (require.main === module && process.env.NODE_ENV !== "test") {
+if (require.main === module && env.NODE_ENV !== "test") {
   process.on("SIGTERM", () => {
     void shutdown("SIGTERM");
   });
   process.on("SIGINT", () => {
     void shutdown("SIGINT");
   });
+
+  const repo = new WebhookEndpointRepository(pool);
+  const service = new WebhookService(repo);
+  WebhookQueue.init(repo, service);
+  void WebhookQueue.resumePending();
 
   server = app.listen(port, () => {
     console.log(`revora-backend listening on http://localhost:${port}`);
